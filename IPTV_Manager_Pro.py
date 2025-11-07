@@ -88,7 +88,7 @@ formatter = logging.Formatter('%(levelname)s: %(message)s')
 console_handler.setFormatter(formatter)
 logging.getLogger('').addHandler(console_handler)
 logging.getLogger("requests").setLevel(logging.WARNING)
-logging.getLogger("urllib3").setLevel(logging.WARNING)
+logging.getLogger("urllib3").setLevel(logging.ERROR)
 
 # =============================================================================
 # DATABASE UTILITIES
@@ -364,6 +364,11 @@ def get_stream_counts(server_base_url, username, password, session):
             data = response.json()
             if isinstance(data, list):
                 counts[cat_type] = len(data)
+        except requests.exceptions.ConnectionError as e:
+            if 'NameResolutionError' in str(e):
+                logging.warning(f"DNS/Network Error when fetching {cat_type} streams: {e}")
+            else:
+                logging.warning(f"Connection Error when fetching {cat_type} streams: {e}")
         except (requests.exceptions.RequestException, json.JSONDecodeError) as e:
             logging.warning(f"Could not fetch {cat_type} streams: {e}")
     return counts
@@ -484,8 +489,13 @@ def check_account_status_detailed_api(server_base_url, username, password, sessi
         processed_data['api_message'] = f"HTTP Error {e.response.status_code}"
         if response_text and ('raw_user_info' not in processed_data or not processed_data['raw_user_info']):
              processed_data['raw_user_info'] = json.dumps({"error_context_response": response_text[:500]})
+    except requests.exceptions.ConnectionError as e:
+        if 'NameResolutionError' in str(e):
+            processed_data['api_message'] = "DNS/Network Error"
+        else:
+            processed_data['api_message'] = "Connection Error"
     except requests.exceptions.RequestException as e:
-        processed_data['api_message'] = f"Connection Error: {type(e).__name__}"
+        processed_data['api_message'] = f"Request Error: {type(e).__name__}"
     except json.JSONDecodeError:
         processed_data['api_message'] = "Invalid JSON response"
         if response_text and ('raw_user_info' not in processed_data or not processed_data['raw_user_info']):
@@ -687,9 +697,15 @@ def check_stalker_portal_status(portal_url: str, mac_address: str, session: requ
         processed_data['api_message'] = f"HTTP Error {e.response.status_code} (Stalker)"
         if response_text: processed_data['raw_user_info'] = json.dumps({"error_context_response": response_text[:500]})
         logging.warning(f"Stalker: HTTP Error {e.response.status_code} for MAC {formatted_mac} at {portal_url}. Response: {response_text[:200] if response_text else 'N/A'}")
-    except requests.exceptions.RequestException as e:
-        processed_data['api_message'] = f"Connection Error (Stalker): {type(e).__name__}"
+    except requests.exceptions.ConnectionError as e:
+        if 'NameResolutionError' in str(e):
+            processed_data['api_message'] = "DNS/Network Error (Stalker)"
+        else:
+            processed_data['api_message'] = "Connection Error (Stalker)"
         logging.warning(f"Stalker: Connection Error for MAC {formatted_mac} at {portal_url}: {e}")
+    except requests.exceptions.RequestException as e:
+        processed_data['api_message'] = f"Request Error (Stalker): {type(e).__name__}"
+        logging.warning(f"Stalker: Request Error for MAC {formatted_mac} at {portal_url}: {e}")
     except json.JSONDecodeError:
         processed_data['api_message'] = "Invalid JSON response (Stalker)"
         if response_text: processed_data['raw_user_info'] = json.dumps({"non_json_response": response_text[:500]})
