@@ -31,4 +31,4 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: IPTV-Manager-Pro-Windows
-          path: dist/IPTV_Manager_Pro.exe
+          path: dist/IPTV_Manager_ProPV.exe
