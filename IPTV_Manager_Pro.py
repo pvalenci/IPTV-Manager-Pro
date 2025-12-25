@@ -1205,7 +1205,7 @@ class EntryFilterProxyModel(QSortFilterProxyModel):
 # =============================================================================
 # MAIN APPLICATION WINDOW
 # =============================================================================
-COLUMN_HEADERS = ["ID", "Name", "Category", "API Status", "Channels", "Movies", "Series", "Expires", "Trial?", "Active", "Max", "Last Checked", "Server", "User / MAC", "Message"]
+COLUMN_HEADERS = ["ID", "Name", "Category", "API Status", "Channels", "Movies", "Series", "Expires", "Trial?", "Active", "Max", "Last Checked", "Server", "User / MAC", "Password", "Message"]
 
 class MainWindow(QMainWindow):
     def __init__(self):
