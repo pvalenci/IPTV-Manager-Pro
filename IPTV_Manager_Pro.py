@@ -7,6 +7,7 @@ import sqlite3
 import json
 import logging
 import time
+import csv
 import re # Added for MAC address validation
 from typing import Optional # Added for type hinting
 # import html # Not currently used
@@ -57,7 +58,7 @@ def resource_path(relative_path):
 
 # --- Configuration ---
 APP_NAME = "IPTV Manager Pro"
-APP_VERSION = "0.3" # Incremented version for new features
+APP_VERSION = "0.4.pv" # Incremented version for new features
 DATABASE_NAME = 'iptv_store.db'
 LOG_FILE = 'iptv_manager_log.txt'
 USER_AGENT = f'{APP_NAME}/{APP_VERSION} (okhttp/3.12.1)'
@@ -1162,7 +1163,7 @@ class ApiCheckerWorker(QObject):
 # CUSTOM PROXY MODEL FOR FILTERING
 # =============================================================================
 COL_ID, COL_NAME, COL_CATEGORY, COL_STATUS, COL_CHANNELS, COL_MOVIES, COL_SERIES, COL_EXPIRY, COL_TRIAL, \
-COL_ACTIVE_CONN, COL_MAX_CONN, COL_LAST_CHECKED, COL_SERVER, COL_USER, COL_MSG = range(15)
+COL_ACTIVE_CONN, COL_MAX_CONN, COL_LAST_CHECKED, COL_SERVER, COL_USER, COL_PASSWORD, COL_MSG = range(16)
 
 class EntryFilterProxyModel(QSortFilterProxyModel):
     def __init__(self, parent=None):
@@ -1286,10 +1287,13 @@ class MainWindow(QMainWindow):
         export_buttons_layout.addWidget(self.export_clipboard_button)
         self.export_txt_button = QPushButton("Export Links (Selected)")
         export_buttons_layout.addWidget(self.export_txt_button)
+        self.export_csv_button = QPushButton("Export Table (CSV)")
+        export_buttons_layout.addWidget(self.export_csv_button)
         export_buttons_layout.addStretch()
         top_controls_layout.addSpacing(20)
         top_controls_layout.addWidget(self.export_clipboard_button)
         top_controls_layout.addWidget(self.export_txt_button)
+        top_controls_layout.addWidget(self.export_csv_button)
 
         secondary_controls_layout = QHBoxLayout()
         self.check_selected_button = QPushButton("Check Selected")
@@ -1368,6 +1372,7 @@ class MainWindow(QMainWindow):
         self.check_all_button.clicked.connect(self.check_all_entries_action)
         self.export_clipboard_button.clicked.connect(self.export_current_to_clipboard)
         self.export_txt_button.clicked.connect(self.export_selected_to_txt)
+        self.export_csv_button.clicked.connect(self.export_table_to_csv)
 
         self.table_view.doubleClicked.connect(self.edit_entry_action)
         self.category_filter_combo.currentTextChanged.connect(self.category_filter_changed)
@@ -1433,9 +1438,11 @@ class MainWindow(QMainWindow):
         if account_type == 'stalker':
             items.append(QStandardItem(entry_data['portal_url'] or 'N/A')) # Server column
             items.append(QStandardItem(entry_data['mac_address'] or 'N/A')) # Username column, now User/MAC
+            items.append(QStandardItem("")) # Password column (empty for Stalker)
         else: # XC or if somehow account_type is None and defaulted to 'xc'
             items.append(QStandardItem(entry_data['server_base_url'] or 'N/A'))
             items.append(QStandardItem(entry_data['username'] or 'N/A'))
+            items.append(QStandardItem(entry_data['password'] or '')) # Password column
 
         api_msg = entry_data['api_message'] if entry_data['api_message'] is not None else ""
         items.append(QStandardItem(api_msg))
@@ -1479,6 +1486,7 @@ class MainWindow(QMainWindow):
         self.bulk_edit_button.setEnabled(has_selection and can_interact)
         self.check_selected_button.setEnabled(has_selection and can_interact)
         self.export_txt_button.setEnabled(has_selection and can_interact)
+        self.export_csv_button.setEnabled(self.proxy_model.rowCount() > 0 and can_interact)
 
         self.check_all_button.setEnabled(self.proxy_model.rowCount() > 0 and can_interact)
 
@@ -1828,6 +1836,26 @@ class MainWindow(QMainWindow):
                 logging.error(f"Error writing export file '{file_path}': {e}")
                 QMessageBox.critical(self, "File Error", f"Could not write to file: {e}")
 
+    @Slot()
+    def export_table_to_csv(self):
+        file_path, _ = QFileDialog.getSaveFileName(self, "Export Table to CSV", "", "CSV Files (*.csv);;All Files (*)")
+        if not file_path: return
+        try:
+            with open(file_path, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                # Write headers
+                writer.writerow(COLUMN_HEADERS)
+                # Write rows from proxy model (to respect sort/filter)
+                for row in range(self.proxy_model.rowCount()):
+                    row_data = []
+                    for col in range(self.proxy_model.columnCount()):
+                        idx = self.proxy_model.index(row, col)
+                        row_data.append(str(idx.data()))
+                    writer.writerow(row_data)
+            QMessageBox.information(self, "Export Successful", f"Table exported to {file_path}")
+        except Exception as e:
+            logging.error(f"CSV Export Error: {e}")
+            QMessageBox.critical(self, "Export Error", f"Could not export: {e}")
 
     def get_selected_entry_ids(self):
         ids = []
