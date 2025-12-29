@@ -1168,8 +1168,8 @@ class ApiCheckerWorker(QObject):
 # =============================================================================
 # CUSTOM PROXY MODEL FOR FILTERING
 # =============================================================================
-COL_ID, COL_NAME, COL_CATEGORY, COL_STATUS, COL_CHANNELS, COL_MOVIES, COL_SERIES, COL_EXPIRY, COL_TRIAL, \
-COL_ACTIVE_CONN, COL_MAX_CONN, COL_LAST_CHECKED, COL_SERVER, COL_USER, COL_PASSWORD, COL_MSG = range(16)
+COL_ID, COL_NAME, COL_CATEGORY, COL_STATUS, COL_CHANNELS, COL_MOVIES, COL_SERIES, COL_EXPIRY, \
+COL_ACTIVE_CONN, COL_MAX_CONN, COL_LAST_CHECKED, COL_SERVER, COL_USER, COL_PASSWORD, COL_MSG = range(15)
 
 class EntryFilterProxyModel(QSortFilterProxyModel):
     def __init__(self, parent=None):
@@ -1201,7 +1201,7 @@ class EntryFilterProxyModel(QSortFilterProxyModel):
             return False
 
         if self._exclude_na:
-            na_check_columns = [COL_EXPIRY, COL_TRIAL, COL_ACTIVE_CONN, COL_MAX_CONN, COL_LAST_CHECKED, COL_STATUS]
+            na_check_columns = [COL_EXPIRY, COL_ACTIVE_CONN, COL_MAX_CONN, COL_LAST_CHECKED, COL_STATUS]
             for col in na_check_columns:
                 idx = self.sourceModel().index(source_row, col, source_parent)
                 data_str = str(self.sourceModel().data(idx)).upper()
@@ -1212,7 +1212,7 @@ class EntryFilterProxyModel(QSortFilterProxyModel):
 # =============================================================================
 # MAIN APPLICATION WINDOW
 # =============================================================================
-COLUMN_HEADERS = ["ID", "Name", "Category", "API Status", "Channels", "Movies", "Series", "Expires", "Trial?", "Active", "Max", "Last Checked", "Server", "User / MAC", "Password", "Message"]
+COLUMN_HEADERS = ["ID", "Name", "Category", "Status", "Channels", "Movies", "Series", "Expires", "Active", "Max", "Last Checked", "Server", "User / MAC", "Password", "Message"]
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -1349,7 +1349,6 @@ class MainWindow(QMainWindow):
         header.setSectionResizeMode(COL_MOVIES, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(COL_SERIES, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(COL_EXPIRY, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(COL_TRIAL, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(COL_ACTIVE_CONN, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(COL_MAX_CONN, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(COL_LAST_CHECKED, QHeaderView.ResizeToContents)
@@ -1425,7 +1424,6 @@ class MainWindow(QMainWindow):
         items.append(QStandardItem(str(entry_data['movies_count']) if entry_data['movies_count'] is not None else "N/A"))
         items.append(QStandardItem(str(entry_data['series_count']) if entry_data['series_count'] is not None else "N/A"))
         items.append(QStandardItem(format_timestamp_display(entry_data['expiry_date_ts'])))
-        items.append(QStandardItem(format_trial_status_display(entry_data['is_trial'])))
         active_c = entry_data['active_connections']; items.append(QStandardItem(str(active_c) if active_c is not None else "N/A"))
         max_c = entry_data['max_connections']; items.append(QStandardItem(str(max_c) if max_c is not None else "N/A"))
         last_chk_raw = entry_data['last_checked_at']; last_chk_disp = "Never"
@@ -1444,11 +1442,16 @@ class MainWindow(QMainWindow):
         if account_type == 'stalker':
             items.append(QStandardItem(entry_data['portal_url'] or 'N/A')) # Server column
             items.append(QStandardItem(entry_data['mac_address'] or 'N/A')) # Username column, now User/MAC
-            items.append(QStandardItem("")) # Password column (empty for Stalker)
+            pwd_item = QStandardItem("") # Password column (empty for Stalker)
         else: # XC or if somehow account_type is None and defaulted to 'xc'
             items.append(QStandardItem(entry_data['server_base_url'] or 'N/A'))
             items.append(QStandardItem(entry_data['username'] or 'N/A'))
-            items.append(QStandardItem(entry_data['password'] or '')) # Password column
+            pwd_item = QStandardItem(entry_data['password'] or '') # Password column
+
+        # Apply password column shading immediately upon creation
+        pwd_bg_color = QColor("#2b2b2b") if self.dark_theme_action.isChecked() else QColor("#e6e6e6")
+        pwd_item.setBackground(pwd_bg_color)
+        items.append(pwd_item)
 
         api_msg = entry_data['api_message'] if entry_data['api_message'] is not None else ""
         items.append(QStandardItem(api_msg))
@@ -2066,18 +2069,17 @@ class MainWindow(QMainWindow):
             QApplication.instance().setStyleSheet("""
                 QWidget { background-color: #f0f0f0; color: #333; }
                 QTableView { background-color: white; selection-background-color: #a6cfff; }
-                QHeaderView::section { background-color: #e0e0e0; }
                 QPushButton { background-color: #d0d0d0; border: 1px solid #b0b0b0; padding: 5px; }
                 QPushButton:hover { background-color: #c0c0c0; }
                 QLineEdit, QComboBox { background-color: white; border: 1px solid #ccc; padding: 3px; }
             """)
+            default_header_bg = QColor("#e0e0e0")
         elif theme_name == "dark":
             self.dark_theme_action.setChecked(True)
             self.light_theme_action.setChecked(False)
             QApplication.instance().setStyleSheet("""
                 QWidget { background-color: #2e2e2e; color: #f0f0f0; }
                 QTableView { background-color: #3e3e3e; selection-background-color: #5a5a5a; }
-                QHeaderView::section { background-color: #4e4e4e; }
                 QPushButton { background-color: #5e5e5e; border: 1px solid #7e7e7e; padding: 5px; }
                 QPushButton:hover { background-color: #6e6e6e; }
                 QLineEdit, QComboBox { background-color: #4e4e4e; border: 1px solid #6e6e6e; padding: 3px; }
@@ -2085,8 +2087,37 @@ class MainWindow(QMainWindow):
                 QMenu::item:selected { background-color: #5a5a5a; }
                 QStatusBar { background-color: #2e2e2e; }
             """)
+            default_header_bg = QColor("#4e4e4e")
+
+        # Programmatically set default header background for all columns first
+        if hasattr(self, 'table_model') and self.table_model is not None:
+             for col in range(self.table_model.columnCount()):
+                 self.table_model.setHeaderData(col, Qt.Horizontal, default_header_bg, Qt.BackgroundRole)
+
+        # Apply specific password shading (overrides default for that column)
+        self.apply_password_column_shading()
+
         self.save_settings()
         self.refresh_table_coloring_on_theme_change() # Add this call
+
+    def apply_password_column_shading(self):
+        """Applies shading to the password column (header and cells)."""
+        if not hasattr(self, 'table_model') or self.table_model is None:
+            return
+
+        is_dark = self.dark_theme_action.isChecked()
+        # Define colors
+        header_bg = QColor("#3a3a3a") if is_dark else QColor("#d0d0d0")
+        cell_bg = QColor("#2b2b2b") if is_dark else QColor("#e6e6e6")
+
+        # Set Header Background for Password Column
+        self.table_model.setHeaderData(COL_PASSWORD, Qt.Horizontal, header_bg, Qt.BackgroundRole)
+
+        # Update existing rows
+        for row in range(self.table_model.rowCount()):
+            item = self.table_model.item(row, COL_PASSWORD)
+            if item:
+                item.setBackground(cell_bg)
 
     def refresh_table_coloring_on_theme_change(self):
         """Refreshes the coloring of status items in the table after a theme change."""
@@ -2094,6 +2125,10 @@ class MainWindow(QMainWindow):
             return
 
         logging.debug("Refreshing table item coloring due to theme change.")
+
+        # Re-apply password column shading
+        self.apply_password_column_shading()
+
         for row in range(self.table_model.rowCount()):
             # Assuming COL_STATUS is the correct column index for the API status
             status_item = self.table_model.item(row, COL_STATUS)
