@@ -1,3 +1,9 @@
+
+import time
+print(">>> SCRIPT STARTED <<<")
+time.sleep(3)
+print(">>> IPTV APP STARTING <<<")
+
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
@@ -2121,3 +2127,14 @@ if __name__ == "__main__":
     main_window = MainWindow()
     main_window.show()
     sys.exit(app.exec())
+
+
+    import traceback
+import sys
+
+def excepthook(exc_type, exc_value, exc_traceback):
+    print(">>> UNCAUGHT EXCEPTION <<<")
+    traceback.print_exception(exc_type, exc_value, exc_traceback)
+    input("Press Enter to exit...")
+
+sys.excepthook = excepthook
