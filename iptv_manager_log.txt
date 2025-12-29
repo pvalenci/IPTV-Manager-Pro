@@ -1,1 +1,1 @@
-
+2025-12-29 07:17:53,980 - INFO - IPTV_Manager_Pro.py:2167 - Application starting with DEBUG level logging.

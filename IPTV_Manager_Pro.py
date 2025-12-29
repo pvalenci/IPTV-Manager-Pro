@@ -165,6 +165,11 @@ def initialize_database():
         except sqlite3.OperationalError:
             logging.info("Adding 'series_count' column to entries table.")
             cursor.execute("ALTER TABLE entries ADD COLUMN series_count INTEGER")
+        try:
+            cursor.execute("SELECT comments FROM entries LIMIT 1")
+        except sqlite3.OperationalError:
+            logging.info("Adding 'comments' column to entries table.")
+            cursor.execute("ALTER TABLE entries ADD COLUMN comments TEXT")
 
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS categories (
@@ -183,28 +188,28 @@ def initialize_database():
     finally:
         if conn: conn.close()
 
-def add_entry(name, category, server_url, username, password, account_type='xc', mac_address=None, portal_url=None):
+def add_entry(name, category, server_url, username, password, account_type='xc', mac_address=None, portal_url=None, comments=None):
     conn = get_db_connection()
     try:
         cursor = conn.execute('''
-            INSERT INTO entries (name, category, server_base_url, username, password, account_type, mac_address, portal_url)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (name, category, server_url, username, password, account_type, mac_address, portal_url))
+            INSERT INTO entries (name, category, server_base_url, username, password, account_type, mac_address, portal_url, comments)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (name, category, server_url, username, password, account_type, mac_address, portal_url, comments))
         conn.commit()
         entry_id = cursor.lastrowid
         logging.info(f"Added entry: {name} (ID: {entry_id}, Type: {account_type})")
         return entry_id
     finally: conn.close()
 
-def update_entry(entry_id, name, category, server_url, username, password, account_type='xc', mac_address=None, portal_url=None):
+def update_entry(entry_id, name, category, server_url, username, password, account_type='xc', mac_address=None, portal_url=None, comments=None):
     conn = get_db_connection()
     try:
         conn.execute('''
             UPDATE entries
             SET name = ?, category = ?, server_base_url = ?, username = ?, password = ?,
-                account_type = ?, mac_address = ?, portal_url = ?
+                account_type = ?, mac_address = ?, portal_url = ?, comments = ?
             WHERE id = ?
-        ''', (name, category, server_url, username, password, account_type, mac_address, portal_url, entry_id))
+        ''', (name, category, server_url, username, password, account_type, mac_address, portal_url, comments, entry_id))
         conn.commit()
         logging.info(f"Updated entry ID: {entry_id} (Type: {account_type})")
     finally: conn.close()
@@ -349,7 +354,7 @@ def format_timestamp_display(unix_timestamp_utc):
     if unix_timestamp_utc is None or not isinstance(unix_timestamp_utc, (int, float)) or unix_timestamp_utc <= 0: return "N/A"
     try:
         dt_utc = datetime.fromtimestamp(int(unix_timestamp_utc), tz=timezone.utc); dt_local = dt_utc.astimezone(DISPLAY_TZ)
-        return dt_local.strftime('%Y-%m-%d %H:%M %Z')
+        return dt_local.strftime('%Y-%m-%d %H:%M')
     except: return "Invalid"
 
 def format_trial_status_display(is_trial):
@@ -718,6 +723,8 @@ class EntryDialog(QDialog):
         self.category_combo = QComboBox()
         self.populate_categories()
 
+        self.comments_edit = QLineEdit()
+
         self.account_type_combo = QComboBox()
         self.account_type_combo.addItems(["Xtream Codes API", "Stalker Portal"])
         self.account_type_combo.currentTextChanged.connect(self.toggle_input_fields)
@@ -739,6 +746,7 @@ class EntryDialog(QDialog):
 
         form_layout.addRow("Display Name:", self.name_edit)
         form_layout.addRow("Category:", self.category_combo)
+        form_layout.addRow("Comments:", self.comments_edit)
         form_layout.addRow("Account Type:", self.account_type_combo)
 
         # Add XC fields (will be shown/hidden)
@@ -790,6 +798,8 @@ class EntryDialog(QDialog):
             entry = get_entry_by_id(self.entry_id)
             if entry:
                 self.name_edit.setText(entry['name'])
+                if 'comments' in entry.keys():
+                    self.comments_edit.setText(entry['comments'] or "")
                 # entry is an sqlite3.Row object.
                 current_account_type = entry['account_type'] if entry['account_type'] is not None else 'xc'
                 type_display_name = "Stalker Portal" if current_account_type == 'stalker' else "Xtream Codes API"
@@ -821,6 +831,7 @@ class EntryDialog(QDialog):
         data = {
             "name": self.name_edit.text().strip(),
             "category": self.category_combo.currentText(),
+            "comments": self.comments_edit.text().strip(),
             "account_type_text": self.account_type_combo.currentText()
         }
         if data["account_type_text"] == "Stalker Portal":
@@ -876,11 +887,11 @@ class EntryDialog(QDialog):
             if self.is_edit_mode:
                 update_entry(self.entry_id, data['name'], data['category'],
                              data['server_url'], data['username'], data['password'],
-                             data['account_type'], data['mac_address'], data['portal_url'])
+                             data['account_type'], data['mac_address'], data['portal_url'], data['comments'])
             else:
                 add_entry(data['name'], data['category'],
                           data['server_url'], data['username'], data['password'],
-                          data['account_type'], data['mac_address'], data['portal_url'])
+                          data['account_type'], data['mac_address'], data['portal_url'], data['comments'])
             self.accept()
         except Exception as e: logging.error(f"Error saving entry: {e}"); QMessageBox.critical(self, "Database Error", f"Could not save: {e}")
 
@@ -1168,8 +1179,8 @@ class ApiCheckerWorker(QObject):
 # =============================================================================
 # CUSTOM PROXY MODEL FOR FILTERING
 # =============================================================================
-COL_ID, COL_NAME, COL_CATEGORY, COL_STATUS, COL_CHANNELS, COL_MOVIES, COL_SERIES, COL_EXPIRY, \
-COL_ACTIVE_CONN, COL_MAX_CONN, COL_LAST_CHECKED, COL_SERVER, COL_USER, COL_PASSWORD, COL_MSG = range(15)
+COL_ID, COL_NAME, COL_CATEGORY, COL_COMMENTS, COL_STATUS, COL_CHANNELS, COL_MOVIES, COL_SERIES, COL_EXPIRY, \
+COL_ACTIVE_CONN, COL_MAX_CONN, COL_LAST_CHECKED, COL_SERVER, COL_USER, COL_PASSWORD, COL_MSG = range(16)
 
 class EntryFilterProxyModel(QSortFilterProxyModel):
     def __init__(self, parent=None):
@@ -1190,7 +1201,7 @@ class EntryFilterProxyModel(QSortFilterProxyModel):
         search_match = True
         if self._search_text:
             search_match = False
-            search_columns = [COL_NAME, COL_CATEGORY, COL_STATUS, COL_SERVER, COL_USER, COL_MSG]
+            search_columns = [COL_NAME, COL_CATEGORY, COL_COMMENTS, COL_STATUS, COL_SERVER, COL_USER, COL_MSG]
             for col in search_columns:
                 idx = self.sourceModel().index(source_row, col, source_parent)
                 data = self.sourceModel().data(idx)
@@ -1212,7 +1223,7 @@ class EntryFilterProxyModel(QSortFilterProxyModel):
 # =============================================================================
 # MAIN APPLICATION WINDOW
 # =============================================================================
-COLUMN_HEADERS = ["ID", "Name", "Category", "Status", "Channels", "Movies", "Series", "Expires", "Active", "Max", "Last Checked", "Server", "User / MAC", "Password", "Message"]
+COLUMN_HEADERS = ["ID", "Name", "Category", "Comments", "Status", "Channels", "Movies", "Series", "Expires", "Active", "Max", "Last Checked", "Server", "User / MAC", "Password", "Message"]
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -1344,6 +1355,8 @@ class MainWindow(QMainWindow):
         header.setSectionResizeMode(COL_NAME, QHeaderView.Interactive)
         self.table_view.setColumnWidth(COL_NAME, 200)
         header.setSectionResizeMode(COL_CATEGORY, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(COL_COMMENTS, QHeaderView.Interactive)
+        self.table_view.setColumnWidth(COL_COMMENTS, 150)
         header.setSectionResizeMode(COL_STATUS, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(COL_CHANNELS, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(COL_MOVIES, QHeaderView.ResizeToContents)
@@ -1418,6 +1431,13 @@ class MainWindow(QMainWindow):
     def create_row_items(self, entry_data):
         items = []; id_item = QStandardItem(str(entry_data['id'])); id_item.setData(entry_data['id'], Qt.UserRole); items.append(id_item)
         items.append(QStandardItem(entry_data['name'])); items.append(QStandardItem(entry_data['category']))
+
+        # Add Comments column item
+        comments_text = ""
+        if 'comments' in entry_data.keys() and entry_data['comments']:
+            comments_text = entry_data['comments']
+        items.append(QStandardItem(comments_text))
+
         status_val = entry_data['api_status'] if entry_data['api_status'] is not None else "Not Checked"
         status_item = QStandardItem(status_val); self.apply_status_coloring(status_item, status_val); items.append(status_item)
         items.append(QStandardItem(str(entry_data['live_streams_count']) if entry_data['live_streams_count'] is not None else "N/A"))
