@@ -736,7 +736,7 @@ class EntryDialog(QDialog):
         self.username_edit = QLineEdit()
         self.password_label = QLabel("Password:")
         self.password_edit = QLineEdit()
-        self.password_edit.setEchoMode(QLineEdit.Password)
+        # self.password_edit.setEchoMode(QLineEdit.Password) # Password unmasked per request
 
         # Stalker Portal Fields
         self.portal_url_label = QLabel("Portal URL (e.g., http://domain:port/c/):")
