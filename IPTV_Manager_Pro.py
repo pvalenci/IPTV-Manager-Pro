@@ -1435,14 +1435,18 @@ class MainWindow(QMainWindow):
         # The 'account_type' column should exist due to migrations, defaulting to 'xc'.
         account_type = entry_data['account_type'] if entry_data['account_type'] is not None else 'xc'
 
+        password_item = None
         if account_type == 'stalker':
             items.append(QStandardItem(entry_data['portal_url'] or 'N/A')) # Server column
             items.append(QStandardItem(entry_data['mac_address'] or 'N/A')) # Username column, now User/MAC
-            items.append(QStandardItem("")) # Password column (empty for Stalker)
+            password_item = QStandardItem("") # Password column (empty for Stalker)
         else: # XC or if somehow account_type is None and defaulted to 'xc'
             items.append(QStandardItem(entry_data['server_base_url'] or 'N/A'))
             items.append(QStandardItem(entry_data['username'] or 'N/A'))
-            items.append(QStandardItem(entry_data['password'] or '')) # Password column
+            password_item = QStandardItem(entry_data['password'] or '') # Password column
+
+        self.apply_password_styling(password_item)
+        items.append(password_item)
 
         api_msg = entry_data['api_message'] if entry_data['api_message'] is not None else ""
         items.append(QStandardItem(api_msg))
@@ -1472,6 +1476,15 @@ class MainWindow(QMainWindow):
             else: color = QColor("gray") # Grey for "Not Checked" or other statuses in light mode
 
         item.setForeground(color)
+
+    def apply_password_styling(self, item):
+        """Applies background shading to the password column."""
+        if self.dark_theme_action.isChecked():
+            # Darker grey for dark mode
+            item.setBackground(QColor("#404040"))
+        else:
+            # Light grey for light mode
+            item.setBackground(QColor("#f0f0f0"))
 
     @Slot()
     def update_action_button_states(self):
@@ -2083,17 +2096,23 @@ class MainWindow(QMainWindow):
         self.refresh_table_coloring_on_theme_change() # Add this call
 
     def refresh_table_coloring_on_theme_change(self):
-        """Refreshes the coloring of status items in the table after a theme change."""
+        """Refreshes the coloring of status items and password shading in the table after a theme change."""
         if not hasattr(self, 'table_model') or self.table_model is None:
             return
 
         logging.debug("Refreshing table item coloring due to theme change.")
         for row in range(self.table_model.rowCount()):
-            # Assuming COL_STATUS is the correct column index for the API status
+            # Update Status Coloring
             status_item = self.table_model.item(row, COL_STATUS)
             if status_item:
                 status_text = status_item.text()
                 self.apply_status_coloring(status_item, status_text)
+
+            # Update Password Shading
+            password_item = self.table_model.item(row, COL_PASSWORD)
+            if password_item:
+                self.apply_password_styling(password_item)
+
         # If using a proxy model, you might need to trigger an update for the view,
         # but changing item properties directly often reflects. If not, further signals might be needed.
 
