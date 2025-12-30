@@ -1225,6 +1225,7 @@ class EntryFilterProxyModel(QSortFilterProxyModel):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._search_text = ""
+        self._status_filter = "All Statuses"
         self._exclude_na = False
         self._na_strings = {"N/A", "INVALID", "NOT CHECKED", "NEVER"}
 
@@ -1232,11 +1233,22 @@ class EntryFilterProxyModel(QSortFilterProxyModel):
         self._search_text = text.lower()
         self.invalidateFilter()
 
+    def set_status_filter(self, status):
+        self._status_filter = status
+        self.invalidateFilter()
+
     def set_exclude_na(self, exclude):
         self._exclude_na = exclude
         self.invalidateFilter()
 
     def filterAcceptsRow(self, source_row, source_parent):
+        # Status Filter
+        if self._status_filter != "All Statuses":
+            idx = self.sourceModel().index(source_row, COL_STATUS, source_parent)
+            status_val = str(self.sourceModel().data(idx))
+            if status_val != self._status_filter:
+                return False
+
         search_match = True
         if self._search_text:
             search_match = False
@@ -1371,6 +1383,11 @@ class MainWindow(QMainWindow):
         self.category_filter_combo = QComboBox()
         self.category_filter_combo.setMinimumWidth(150)
         filter_controls_layout.addWidget(self.category_filter_combo)
+        filter_controls_layout.addSpacing(10)
+        filter_controls_layout.addWidget(QLabel("Status:"))
+        self.status_filter_combo = QComboBox()
+        self.status_filter_combo.setMinimumWidth(150)
+        filter_controls_layout.addWidget(self.status_filter_combo)
         self.exclude_na_button = QPushButton("Exclude N/A")
         self.exclude_na_button.setCheckable(True)
         filter_controls_layout.addWidget(self.exclude_na_button)
@@ -1450,6 +1467,7 @@ class MainWindow(QMainWindow):
         self.table_view.doubleClicked.connect(self.edit_entry_action)
         self.table_model.itemChanged.connect(self.on_table_item_changed)
         self.category_filter_combo.currentTextChanged.connect(self.category_filter_changed)
+        self.status_filter_combo.currentTextChanged.connect(self.status_filter_changed)
         self.search_edit.textChanged.connect(self.on_search_text_changed)
         self.exclude_na_button.toggled.connect(self.on_exclude_na_toggled)
 
@@ -1464,10 +1482,32 @@ class MainWindow(QMainWindow):
         idx = self.category_filter_combo.findText(cur_sel); self.category_filter_combo.setCurrentIndex(idx if idx != -1 else 0)
         self.category_filter_combo.blockSignals(False)
 
+    def update_status_filter_combo(self):
+        cur_sel = self.status_filter_combo.currentText()
+        self.status_filter_combo.blockSignals(True)
+        self.status_filter_combo.clear()
+        self.status_filter_combo.addItem("All Statuses")
+
+        statuses = set()
+        for row in range(self.table_model.rowCount()):
+            item = self.table_model.item(row, COL_STATUS)
+            if item:
+                statuses.add(item.text())
+
+        self.status_filter_combo.addItems(sorted(list(statuses)))
+
+        idx = self.status_filter_combo.findText(cur_sel)
+        self.status_filter_combo.setCurrentIndex(idx if idx != -1 else 0)
+        self.status_filter_combo.blockSignals(False)
+
     @Slot(str)
     def category_filter_changed(self, cat_name):
         self.current_category_filter = cat_name;
         self.load_entries_to_table()
+
+    @Slot(str)
+    def status_filter_changed(self, status_text):
+        self.proxy_model.set_status_filter(status_text)
 
     @Slot(str)
     def on_search_text_changed(self, text):
@@ -1482,6 +1522,8 @@ class MainWindow(QMainWindow):
         try:
             for row_data in get_all_entries(category_filter=self.current_category_filter): self.table_model.appendRow(self.create_row_items(row_data))
         except Exception as e: logging.error(f"Error loading entries: {e}"); QMessageBox.critical(self, "Load Error", f"Could not load: {e}")
+
+        self.update_status_filter_combo()
         self.proxy_model.invalidateFilter()
 
     def create_row_items(self, entry_data):
@@ -1594,6 +1636,7 @@ class MainWindow(QMainWindow):
         self.manage_categories_button.setEnabled(can_interact)
 
         self.category_filter_combo.setEnabled(can_interact)
+        self.status_filter_combo.setEnabled(can_interact)
         self.search_edit.setEnabled(can_interact)
         self.exclude_na_button.setEnabled(can_interact)
 
