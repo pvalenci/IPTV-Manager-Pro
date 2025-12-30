@@ -282,6 +282,15 @@ def update_entry_status(entry_id, status_data):
     except Exception as e: logging.error(f"Failed to update status for entry ID {entry_id}: {e}")
     finally: conn.close()
 
+def update_entry_comment(entry_id, new_comment):
+    conn = get_db_connection()
+    try:
+        conn.execute("UPDATE entries SET comments = ? WHERE id = ?", (new_comment, entry_id))
+        conn.commit()
+        logging.info(f"Updated comment for entry ID: {entry_id}")
+    finally:
+        conn.close()
+
 def get_all_categories():
     conn = get_db_connection()
     try:
@@ -1377,31 +1386,44 @@ class MainWindow(QMainWindow):
 
         self.table_view.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table_view.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        self.table_view.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table_view.setEditTriggers(QAbstractItemView.DoubleClicked | QAbstractItemView.EditKeyPressed)
         self.table_view.setSortingEnabled(True)
         self.table_view.sortByColumn(COL_NAME, Qt.AscendingOrder)
         header = self.table_view.horizontalHeader()
-        header.setSectionResizeMode(COL_ID, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(COL_ID, QHeaderView.Interactive)
+        self.table_view.setColumnWidth(COL_ID, 50)
         header.setSectionResizeMode(COL_NAME, QHeaderView.Interactive)
         self.table_view.setColumnWidth(COL_NAME, 200)
         header.setSectionResizeMode(COL_CATEGORY, QHeaderView.Interactive)
         self.table_view.setColumnWidth(COL_CATEGORY, 150)
         header.setSectionResizeMode(COL_COMMENTS, QHeaderView.Interactive)
         self.table_view.setColumnWidth(COL_COMMENTS, 150)
-        header.setSectionResizeMode(COL_STATUS, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(COL_CHANNELS, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(COL_MOVIES, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(COL_SERIES, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(COL_EXPIRY, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(COL_ACTIVE_CONN, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(COL_MAX_CONN, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(COL_LAST_CHECKED, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(COL_STATUS, QHeaderView.Interactive)
+        self.table_view.setColumnWidth(COL_STATUS, 100)
+        header.setSectionResizeMode(COL_CHANNELS, QHeaderView.Interactive)
+        self.table_view.setColumnWidth(COL_CHANNELS, 80)
+        header.setSectionResizeMode(COL_MOVIES, QHeaderView.Interactive)
+        self.table_view.setColumnWidth(COL_MOVIES, 80)
+        header.setSectionResizeMode(COL_SERIES, QHeaderView.Interactive)
+        self.table_view.setColumnWidth(COL_SERIES, 80)
+        header.setSectionResizeMode(COL_EXPIRY, QHeaderView.Interactive)
+        self.table_view.setColumnWidth(COL_EXPIRY, 150)
+        header.setSectionResizeMode(COL_ACTIVE_CONN, QHeaderView.Interactive)
+        self.table_view.setColumnWidth(COL_ACTIVE_CONN, 60)
+        header.setSectionResizeMode(COL_MAX_CONN, QHeaderView.Interactive)
+        self.table_view.setColumnWidth(COL_MAX_CONN, 60)
+        header.setSectionResizeMode(COL_LAST_CHECKED, QHeaderView.Interactive)
+        self.table_view.setColumnWidth(COL_LAST_CHECKED, 150)
         header.setSectionResizeMode(COL_SERVER, QHeaderView.Interactive)
         self.table_view.setColumnWidth(COL_SERVER, 150)
         header.setSectionResizeMode(COL_SERVER_IP, QHeaderView.Interactive)
         self.table_view.setColumnWidth(COL_SERVER_IP, 120)
-        header.setSectionResizeMode(COL_USER, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(COL_MSG, QHeaderView.Stretch)
+        header.setSectionResizeMode(COL_USER, QHeaderView.Interactive)
+        self.table_view.setColumnWidth(COL_USER, 150)
+        header.setSectionResizeMode(COL_PASSWORD, QHeaderView.Interactive)
+        self.table_view.setColumnWidth(COL_PASSWORD, 100)
+        header.setSectionResizeMode(COL_MSG, QHeaderView.Interactive)
+        self.table_view.setColumnWidth(COL_MSG, 250)
         main_layout.addWidget(self.table_view)
         self.setCentralWidget(main_widget)
         self.status_bar = QStatusBar()
@@ -1426,6 +1448,7 @@ class MainWindow(QMainWindow):
         self.export_csv_button.clicked.connect(self.export_table_to_csv)
 
         self.table_view.doubleClicked.connect(self.edit_entry_action)
+        self.table_model.itemChanged.connect(self.on_table_item_changed)
         self.category_filter_combo.currentTextChanged.connect(self.category_filter_changed)
         self.search_edit.textChanged.connect(self.on_search_text_changed)
         self.exclude_na_button.toggled.connect(self.on_exclude_na_toggled)
@@ -1510,6 +1533,13 @@ class MainWindow(QMainWindow):
 
         api_msg = entry_data['api_message'] if entry_data['api_message'] is not None else ""
         items.append(QStandardItem(api_msg))
+
+        for i, item in enumerate(items):
+            if i == COL_COMMENTS:
+                item.setFlags(item.flags() | Qt.ItemIsEditable)
+            else:
+                item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+
         return items
 
     def apply_status_coloring(self, item, status_text):
@@ -1581,6 +1611,10 @@ class MainWindow(QMainWindow):
             if not sel_proxied: return
             current_proxy_index = sel_proxied[0]
 
+        # Prevent opening edit dialog if editing a comment inline
+        if current_proxy_index.column() == COL_COMMENTS:
+            return
+
         src_idx = self.proxy_model.mapToSource(current_proxy_index)
         entry_id_item = self.table_model.itemFromIndex(src_idx.siblingAtColumn(COL_ID))
         if not entry_id_item: return
@@ -1588,6 +1622,16 @@ class MainWindow(QMainWindow):
 
         diag = EntryDialog(entry_id=entry_id, parent=self)
         if diag.exec(): self.refresh_row_by_id(entry_id); self.update_category_filter_combo()
+
+    @Slot(QStandardItem)
+    def on_table_item_changed(self, item):
+        if item.column() == COL_COMMENTS:
+            row = item.row()
+            id_item = self.table_model.item(row, COL_ID)
+            if id_item:
+                entry_id = id_item.data(Qt.UserRole)
+                new_comment = item.text()
+                update_entry_comment(entry_id, new_comment)
 
     @Slot()
     def bulk_edit_category_action(self):
