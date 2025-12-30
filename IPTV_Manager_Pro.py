@@ -15,6 +15,7 @@ import logging
 import time
 import csv
 import re # Added for MAC address validation
+import socket # Added for DNS lookup
 from typing import Optional # Added for type hinting
 # import html # Not currently used
 from urllib.parse import urlparse, parse_qs
@@ -170,6 +171,11 @@ def initialize_database():
         except sqlite3.OperationalError:
             logging.info("Adding 'comments' column to entries table.")
             cursor.execute("ALTER TABLE entries ADD COLUMN comments TEXT")
+        try:
+            cursor.execute("SELECT server_ip FROM entries LIMIT 1")
+        except sqlite3.OperationalError:
+            logging.info("Adding 'server_ip' column to entries table.")
+            cursor.execute("ALTER TABLE entries ADD COLUMN server_ip TEXT")
 
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS categories (
@@ -260,7 +266,8 @@ def update_entry_status(entry_id, status_data):
             SET last_checked_at = ?, api_status = ?, api_message = ?,
                 expiry_date_ts = ?, is_trial = ?, active_connections = ?,
                 max_connections = ?, raw_user_info = ?, raw_server_info = ?,
-                live_streams_count = ?, movies_count = ?, series_count = ?
+                live_streams_count = ?, movies_count = ?, series_count = ?,
+                server_ip = ?
             WHERE id = ?
         ''', (
             current_time_iso, status_data.get('api_status'), status_data.get('api_message'),
@@ -268,7 +275,7 @@ def update_entry_status(entry_id, status_data):
             status_data.get('active_connections'), status_data.get('max_connections'),
             status_data.get('raw_user_info'), status_data.get('raw_server_info'),
             status_data.get('live_streams_count'), status_data.get('movies_count'),
-            status_data.get('series_count'), entry_id
+            status_data.get('series_count'), status_data.get('server_ip'), entry_id
         ))
         conn.commit()
         logging.info(f"Updated status for entry ID: {entry_id} to {status_data.get('api_status')}")
@@ -346,6 +353,20 @@ def parse_get_php_url(url_string):
 # API UTILITIES
 # =============================================================================
 API_HEADERS = {'User-Agent': USER_AGENT}
+
+def resolve_dns_ip(url_string):
+    """Resolves the IP address of the hostname in the given URL."""
+    try:
+        parsed_url = urlparse(url_string)
+        hostname = parsed_url.hostname
+        if hostname:
+            ip_address = socket.gethostbyname(hostname)
+            logging.info(f"Resolved IP for {hostname}: {ip_address}")
+            return ip_address
+    except Exception as e:
+        logging.warning(f"DNS resolution failed for {url_string}: {e}")
+    return "Lookup Failed"
+
 def get_safe_api_value(data_dict, key, default=None):
     if not isinstance(data_dict, dict): return default
     value = data_dict.get(key); return default if value == "" else value
@@ -381,7 +402,8 @@ def check_account_status_detailed_api(server_base_url, username, password, sessi
         'success': False, 'api_status': None, 'api_message': "Check init error",
         'expiry_date_ts': None, 'is_trial': None, 'active_connections': None,
         'max_connections': None, 'raw_user_info': None, 'raw_server_info': None,
-        'live_streams_count': None, 'movies_count': None, 'series_count': None
+        'live_streams_count': None, 'movies_count': None, 'series_count': None,
+        'server_ip': None
     }
     # Session should be initialized before this is called in a loop.
     if not all([server_base_url, username is not None, session]):
@@ -393,6 +415,10 @@ def check_account_status_detailed_api(server_base_url, username, password, sessi
         if not parsed_base.scheme or not parsed_base.netloc:
             raise ValueError("Invalid server_base_url format")
         api_url = f"{server_base_url.rstrip('/')}/player_api.php?username={username}&password={password}&action=get_user_info"
+
+        # Resolve DNS
+        processed_data['server_ip'] = resolve_dns_ip(server_base_url)
+
     except Exception as url_e:
         processed_data['api_message'] = f"Invalid Server URL: {url_e}"
         return processed_data
@@ -546,7 +572,8 @@ def check_stalker_portal_status(portal_url: str, mac_address: str, session: requ
     processed_data = {
         'success': False, 'api_status': "Error", 'api_message': "Check init error (Stalker)",
         'expiry_date_ts': None, 'is_trial': None, 'active_connections': None, # Stalker might not provide these
-        'max_connections': None, 'raw_user_info': None, 'raw_server_info': None # server_info not typical for Stalker
+        'max_connections': None, 'raw_user_info': None, 'raw_server_info': None, # server_info not typical for Stalker
+        'server_ip': None
     }
 
     if not all([portal_url, mac_address, session]):
@@ -556,6 +583,9 @@ def check_stalker_portal_status(portal_url: str, mac_address: str, session: requ
     # Ensure MAC address is in the common format for headers/cookies if needed
     formatted_mac = mac_address.upper() # For Authorization header
     # cookie_mac = mac_address.replace(":", "").lower() # Example for cookie, if portal expects it specifically
+
+    # Resolve DNS
+    processed_data['server_ip'] = resolve_dns_ip(portal_url)
 
     token = _get_stalker_token(session, portal_url, formatted_mac)
 
@@ -1180,7 +1210,7 @@ class ApiCheckerWorker(QObject):
 # CUSTOM PROXY MODEL FOR FILTERING
 # =============================================================================
 COL_ID, COL_NAME, COL_CATEGORY, COL_COMMENTS, COL_STATUS, COL_CHANNELS, COL_MOVIES, COL_SERIES, COL_EXPIRY, \
-COL_ACTIVE_CONN, COL_MAX_CONN, COL_LAST_CHECKED, COL_SERVER, COL_USER, COL_PASSWORD, COL_MSG = range(16)
+COL_ACTIVE_CONN, COL_MAX_CONN, COL_LAST_CHECKED, COL_SERVER, COL_SERVER_IP, COL_USER, COL_PASSWORD, COL_MSG = range(17)
 
 class EntryFilterProxyModel(QSortFilterProxyModel):
     def __init__(self, parent=None):
@@ -1201,7 +1231,7 @@ class EntryFilterProxyModel(QSortFilterProxyModel):
         search_match = True
         if self._search_text:
             search_match = False
-            search_columns = [COL_NAME, COL_CATEGORY, COL_COMMENTS, COL_STATUS, COL_SERVER, COL_USER, COL_MSG]
+            search_columns = [COL_NAME, COL_CATEGORY, COL_COMMENTS, COL_STATUS, COL_SERVER, COL_SERVER_IP, COL_USER, COL_MSG]
             for col in search_columns:
                 idx = self.sourceModel().index(source_row, col, source_parent)
                 data = self.sourceModel().data(idx)
@@ -1223,7 +1253,7 @@ class EntryFilterProxyModel(QSortFilterProxyModel):
 # =============================================================================
 # MAIN APPLICATION WINDOW
 # =============================================================================
-COLUMN_HEADERS = ["ID", "Name", "Category", "Comments", "Status", "Channels", "Movies", "Series", "Expires", "Active", "Max", "Last Checked", "Server", "User / MAC", "Password", "Message"]
+COLUMN_HEADERS = ["ID", "Name", "Category", "Comments", "Status", "Channels", "Movies", "Series", "Expires", "Active", "Max", "Last Checked", "Server", "Server IP", "User / MAC", "Password", "Message"]
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -1367,6 +1397,8 @@ class MainWindow(QMainWindow):
         header.setSectionResizeMode(COL_LAST_CHECKED, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(COL_SERVER, QHeaderView.Interactive)
         self.table_view.setColumnWidth(COL_SERVER, 150)
+        header.setSectionResizeMode(COL_SERVER_IP, QHeaderView.Interactive)
+        self.table_view.setColumnWidth(COL_SERVER_IP, 120)
         header.setSectionResizeMode(COL_USER, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(COL_MSG, QHeaderView.Stretch)
         main_layout.addWidget(self.table_view)
@@ -1461,10 +1493,12 @@ class MainWindow(QMainWindow):
 
         if account_type == 'stalker':
             items.append(QStandardItem(entry_data['portal_url'] or 'N/A')) # Server column
+            items.append(QStandardItem(entry_data['server_ip'] or "N/A")) # Server IP column
             items.append(QStandardItem(entry_data['mac_address'] or 'N/A')) # Username column, now User/MAC
             pwd_item = QStandardItem("") # Password column (empty for Stalker)
         else: # XC or if somehow account_type is None and defaulted to 'xc'
             items.append(QStandardItem(entry_data['server_base_url'] or 'N/A'))
+            items.append(QStandardItem(entry_data['server_ip'] or "N/A")) # Server IP column
             items.append(QStandardItem(entry_data['username'] or 'N/A'))
             pwd_item = QStandardItem(entry_data['password'] or '') # Password column
 
