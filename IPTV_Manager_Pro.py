@@ -1981,7 +1981,9 @@ class MainWindow(QMainWindow):
         failed_count = 0
 
         current_stalker_portal_url_for_mac_list = None
+        current_xc_server_url = None
         mac_pattern = re.compile(r"^([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})$")
+        xc_combo_pattern = re.compile(r"^([^:]+):([^:]+)$")
 
         try:
             with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
@@ -1994,6 +1996,7 @@ class MainWindow(QMainWindow):
                     is_xc_link = "get.php?" in line_content
                     # Check for MAC pattern first, as URLs can be short and might be misidentified by simple http check alone
                     is_potential_mac = mac_pattern.fullmatch(line_content) is not None # Use fullmatch for MAC
+                    is_xc_combo = xc_combo_pattern.fullmatch(line_content) is not None
 
                     # A line is a potential portal URL if it starts with http/https, is NOT an XC link, AND NOT a stalker credential string
                     is_potential_portal_url = (line_content.startswith("http://") or line_content.startswith("https://")) \
@@ -2001,6 +2004,7 @@ class MainWindow(QMainWindow):
 
                     if is_stalker_credential_string:
                         current_stalker_portal_url_for_mac_list = None # Reset context
+                        current_xc_server_url = None
                         try:
                             parts = line_content.split(',')
                             if len(parts) < 2: raise ValueError("Malformed stalker string, missing comma.")
@@ -2030,6 +2034,7 @@ class MainWindow(QMainWindow):
 
                     elif is_xc_link:
                         current_stalker_portal_url_for_mac_list = None # Reset context
+                        current_xc_server_url = None
                         parsed_info = parse_get_php_url(line_content)
                         if parsed_info and not parsed_info.get('error'):
                             try:
@@ -2045,11 +2050,25 @@ class MainWindow(QMainWindow):
                         parsed_val_url = urlparse(line_content)
                         if parsed_val_url.scheme and parsed_val_url.netloc: # Basic validation
                             current_stalker_portal_url_for_mac_list = line_content
-                            logging.info(f"Batch Import: Set current Stalker portal URL for subsequent MACs to: {current_stalker_portal_url_for_mac_list} (from line {line_num})")
+                            current_xc_server_url = line_content
+                            logging.info(f"Batch Import: Set current URL context to: {line_content} (from line {line_num})")
                         else:
                             logging.warning(f"Batch Import: Skipped potential URL (malformed or unsupported) on line {line_num}: {line_content}")
-                            # current_stalker_portal_url_for_mac_list = None # Keep previous context or reset? Let's keep for now.
                             failed_count +=1
+
+                    elif is_xc_combo and current_xc_server_url:
+                        try:
+                            match = xc_combo_pattern.match(line_content)
+                            if match:
+                                username = match.group(1)
+                                password = match.group(2)
+                                host = urlparse(current_xc_server_url).hostname or "host"
+                                display_name = f"{host}_{username}_L{line_num}"
+                                add_entry(display_name, default_category, current_xc_server_url, username, password)
+                                imported_count += 1
+                                logging.info(f"Batch Import: Successfully imported XC combo {username} for server {current_xc_server_url} from line {line_num}")
+                        except Exception as e_xc_combo:
+                            logging.error(f"Batch Import: Error processing XC combo on line {line_num}: {e_xc_combo}"); failed_count += 1
 
                     elif is_potential_mac and current_stalker_portal_url_for_mac_list:
                         mac_address = line_content.strip().upper() # Already validated by is_potential_mac basically
