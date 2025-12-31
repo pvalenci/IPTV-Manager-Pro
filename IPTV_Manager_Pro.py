@@ -384,7 +384,7 @@ def format_timestamp_display(unix_timestamp_utc):
     if unix_timestamp_utc is None or not isinstance(unix_timestamp_utc, (int, float)) or unix_timestamp_utc <= 0: return "N/A"
     try:
         dt_utc = datetime.fromtimestamp(int(unix_timestamp_utc), tz=timezone.utc); dt_local = dt_utc.astimezone(DISPLAY_TZ)
-        return dt_local.strftime('%Y-%m-%d %H:%M')
+        return dt_local.strftime('%y-%m-%d')
     except: return "Invalid"
 
 def format_trial_status_display(is_trial):
