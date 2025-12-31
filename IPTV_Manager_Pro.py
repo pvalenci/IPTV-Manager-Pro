@@ -1092,6 +1092,30 @@ class BulkEditCategoryDialog(QDialog):
     def get_selected_category(self):
         return self.category_combo.currentText()
 
+class BulkEditCommentsDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Bulk Edit Comments")
+        self.setMinimumWidth(400)
+        self.setWindowModality(Qt.WindowModal)
+
+        layout = QVBoxLayout(self)
+        form_layout = QFormLayout()
+
+        self.comment_edit = QLineEdit()
+        self.comment_edit.setPlaceholderText("Enter new comment for selected entries")
+
+        form_layout.addRow("New Comment:", self.comment_edit)
+        layout.addLayout(form_layout)
+
+        self.button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        self.button_box.accepted.connect(self.accept)
+        self.button_box.rejected.connect(self.reject)
+        layout.addWidget(self.button_box)
+
+    def get_comment(self):
+        return self.comment_edit.text()
+
 
 # =============================================================================
 # API CHECKER WORKER
@@ -1375,6 +1399,7 @@ class MainWindow(QMainWindow):
         self.delete_button = QPushButton("Delete Selected")
         self.delete_duplicates_button = QPushButton("Delete Duplicates")
         self.bulk_edit_button = QPushButton("Bulk Edit")
+        self.bulk_edit_comments_button = QPushButton("Bulk Edit Comments")
         self.import_url_button = QPushButton("Import URL")
         self.import_file_button = QPushButton("Import File")
 
@@ -1383,6 +1408,7 @@ class MainWindow(QMainWindow):
         top_controls_layout.addWidget(self.delete_button)
         top_controls_layout.addWidget(self.delete_duplicates_button)
         top_controls_layout.addWidget(self.bulk_edit_button)
+        top_controls_layout.addWidget(self.bulk_edit_comments_button)
         top_controls_layout.addSpacing(10)
         top_controls_layout.addWidget(self.import_url_button)
         top_controls_layout.addWidget(self.import_file_button)
@@ -1504,6 +1530,7 @@ class MainWindow(QMainWindow):
         self.delete_button.clicked.connect(self.delete_entry_action)
         self.delete_duplicates_button.clicked.connect(self.delete_duplicates_action)
         self.bulk_edit_button.clicked.connect(self.bulk_edit_category_action)
+        self.bulk_edit_comments_button.clicked.connect(self.bulk_edit_comments_action)
         self.import_url_button.clicked.connect(self.import_from_url_action)
         self.import_file_button.clicked.connect(self.import_from_file_action)
         self.manage_categories_button.clicked.connect(self.manage_categories_action)
@@ -1730,6 +1757,7 @@ class MainWindow(QMainWindow):
         self.edit_button.setEnabled(selected_row_count == 1 and can_interact)
         self.delete_button.setEnabled(has_selection and can_interact)
         self.bulk_edit_button.setEnabled(has_selection and can_interact)
+        self.bulk_edit_comments_button.setEnabled(has_selection and can_interact)
         self.check_selected_button.setEnabled(has_selection and can_interact)
         self.export_txt_button.setEnabled(has_selection and can_interact)
         self.export_csv_button.setEnabled(self.proxy_model.rowCount() > 0 and can_interact)
@@ -1806,6 +1834,25 @@ class MainWindow(QMainWindow):
             except Exception as e:
                 logging.error(f"Error bulk updating categories: {e}")
                 QMessageBox.critical(self, "Database Error", f"Could not update categories: {e}")
+
+    @Slot()
+    def bulk_edit_comments_action(self):
+        selected_ids = self.get_selected_entry_ids()
+        if not selected_ids:
+            QMessageBox.information(self, "Bulk Edit Comments", "No entries selected.")
+            return
+
+        dialog = BulkEditCommentsDialog(parent=self)
+        if dialog.exec():
+            new_comment = dialog.get_comment()
+            try:
+                for entry_id in selected_ids:
+                    update_entry_comment(entry_id, new_comment)
+                self.load_entries_to_table()
+                QMessageBox.information(self, "Success", f"Comments updated for {len(selected_ids)} entries.")
+            except Exception as e:
+                logging.error(f"Error bulk updating comments: {e}")
+                QMessageBox.critical(self, "Database Error", f"Could not update comments: {e}")
 
     @Slot()
     def delete_entry_action(self):
