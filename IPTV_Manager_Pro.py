@@ -1662,8 +1662,21 @@ class MainWindow(QMainWindow):
         else: # XC or if somehow account_type is None and defaulted to 'xc'
             items.append(QStandardItem(entry_data['server_base_url'] or 'N/A'))
             items.append(QStandardItem(entry_data['server_ip'] or "N/A")) # Server IP column
-            items.append(QStandardItem(entry_data['username'] or 'N/A'))
+            user_item = QStandardItem(entry_data['username'] or 'N/A')
+            items.append(user_item)
             pwd_item = QStandardItem(entry_data['password'] or '') # Password column
+
+        # Check for MAC address shading on the User item
+        # In Stalker mode, the username item is at index COL_USER
+        # We need to find the item we just appended.
+        # Since we append sequentially, let's grab the item at COL_USER
+        # Note: We are building a list 'items' to append to the row.
+        # COL_USER is index 14.
+        # Let's apply it to the item we just created.
+
+        # Determine which item is the user/mac item
+        user_mac_item = items[COL_USER]
+        self.apply_mac_shading(user_mac_item)
 
         # Apply password column shading immediately upon creation
         pwd_bg_color = QColor("#2b2b2b") if self.dark_theme_action.isChecked() else QColor("#e6e6e6")
@@ -2360,6 +2373,25 @@ class MainWindow(QMainWindow):
             if item:
                 item.setBackground(cell_bg)
 
+    def apply_mac_shading(self, item):
+        """Applies subtle blue shading to MAC addresses in the User column."""
+        if not item: return
+
+        text = item.text().strip()
+        # Regex for MAC address (XX:XX:XX:XX:XX:XX or XX-XX-XX-XX-XX-XX)
+        mac_pattern = re.compile(r"^([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})$")
+
+        if mac_pattern.match(text):
+            is_dark = self.dark_theme_action.isChecked()
+            # Subtle blue colors
+            bg_color = QColor("#1E3A5F") if is_dark else QColor("#E3F2FD")
+            item.setBackground(bg_color)
+        else:
+            # Clear background if it's not a MAC (or if previously set)
+            # Note: This might clear password shading if used on wrong column,
+            # but this function is intended for COL_USER.
+            item.setData(None, Qt.BackgroundRole)
+
     def refresh_table_coloring_on_theme_change(self):
         """Refreshes the coloring of status items in the table after a theme change."""
         if not hasattr(self, 'table_model') or self.table_model is None:
@@ -2371,11 +2403,16 @@ class MainWindow(QMainWindow):
         self.apply_password_column_shading()
 
         for row in range(self.table_model.rowCount()):
-            # Assuming COL_STATUS is the correct column index for the API status
+            # Apply Status Coloring
             status_item = self.table_model.item(row, COL_STATUS)
             if status_item:
                 status_text = status_item.text()
                 self.apply_status_coloring(status_item, status_text)
+
+            # Apply MAC Shading
+            user_item = self.table_model.item(row, COL_USER)
+            if user_item:
+                self.apply_mac_shading(user_item)
         # If using a proxy model, you might need to trigger an update for the view,
         # but changing item properties directly often reflects. If not, further signals might be needed.
 
