@@ -1226,6 +1226,8 @@ class EntryFilterProxyModel(QSortFilterProxyModel):
         super().__init__(parent)
         self._search_text = ""
         self._status_filter = "All Statuses"
+        self._server_filter = "All Servers"
+        self._server_ip_filter = "All IPs"
         self._exclude_na = False
         self._na_strings = {"N/A", "INVALID", "NOT CHECKED", "NEVER"}
 
@@ -1237,9 +1239,32 @@ class EntryFilterProxyModel(QSortFilterProxyModel):
         self._status_filter = status
         self.invalidateFilter()
 
+    def set_server_filter(self, server):
+        self._server_filter = server
+        self.invalidateFilter()
+
+    def set_server_ip_filter(self, server_ip):
+        self._server_ip_filter = server_ip
+        self.invalidateFilter()
+
     def set_exclude_na(self, exclude):
         self._exclude_na = exclude
         self.invalidateFilter()
+
+    def lessThan(self, left, right):
+        if left.column() in [COL_ACTIVE_CONN, COL_MAX_CONN, COL_CHANNELS, COL_MOVIES, COL_SERIES, COL_ID]:
+            left_data = self.sourceModel().data(left)
+            right_data = self.sourceModel().data(right)
+
+            def to_float(val):
+                try:
+                    return float(val)
+                except (ValueError, TypeError):
+                    return -1.0 # Treat N/A or invalid as lowest
+
+            return to_float(left_data) < to_float(right_data)
+
+        return super().lessThan(left, right)
 
     def filterAcceptsRow(self, source_row, source_parent):
         # Status Filter
@@ -1247,6 +1272,20 @@ class EntryFilterProxyModel(QSortFilterProxyModel):
             idx = self.sourceModel().index(source_row, COL_STATUS, source_parent)
             status_val = str(self.sourceModel().data(idx))
             if status_val != self._status_filter:
+                return False
+
+        # Server Filter
+        if self._server_filter != "All Servers":
+            idx = self.sourceModel().index(source_row, COL_SERVER, source_parent)
+            server_val = str(self.sourceModel().data(idx))
+            if server_val != self._server_filter:
+                return False
+
+        # Server IP Filter
+        if self._server_ip_filter != "All IPs":
+            idx = self.sourceModel().index(source_row, COL_SERVER_IP, source_parent)
+            ip_val = str(self.sourceModel().data(idx))
+            if ip_val != self._server_ip_filter:
                 return False
 
         search_match = True
@@ -1388,6 +1427,16 @@ class MainWindow(QMainWindow):
         self.status_filter_combo = QComboBox()
         self.status_filter_combo.setMinimumWidth(150)
         filter_controls_layout.addWidget(self.status_filter_combo)
+        filter_controls_layout.addSpacing(10)
+        filter_controls_layout.addWidget(QLabel("Server:"))
+        self.server_filter_combo = QComboBox()
+        self.server_filter_combo.setMinimumWidth(150)
+        filter_controls_layout.addWidget(self.server_filter_combo)
+        filter_controls_layout.addSpacing(10)
+        filter_controls_layout.addWidget(QLabel("Server IP:"))
+        self.server_ip_filter_combo = QComboBox()
+        self.server_ip_filter_combo.setMinimumWidth(150)
+        filter_controls_layout.addWidget(self.server_ip_filter_combo)
         self.exclude_na_button = QPushButton("Exclude N/A")
         self.exclude_na_button.setCheckable(True)
         filter_controls_layout.addWidget(self.exclude_na_button)
@@ -1468,6 +1517,8 @@ class MainWindow(QMainWindow):
         self.table_model.itemChanged.connect(self.on_table_item_changed)
         self.category_filter_combo.currentTextChanged.connect(self.category_filter_changed)
         self.status_filter_combo.currentTextChanged.connect(self.status_filter_changed)
+        self.server_filter_combo.currentTextChanged.connect(self.server_filter_changed)
+        self.server_ip_filter_combo.currentTextChanged.connect(self.server_ip_filter_changed)
         self.search_edit.textChanged.connect(self.on_search_text_changed)
         self.exclude_na_button.toggled.connect(self.on_exclude_na_toggled)
 
@@ -1500,6 +1551,42 @@ class MainWindow(QMainWindow):
         self.status_filter_combo.setCurrentIndex(idx if idx != -1 else 0)
         self.status_filter_combo.blockSignals(False)
 
+    def update_server_filter_combo(self):
+        cur_sel = self.server_filter_combo.currentText()
+        self.server_filter_combo.blockSignals(True)
+        self.server_filter_combo.clear()
+        self.server_filter_combo.addItem("All Servers")
+
+        servers = set()
+        for row in range(self.table_model.rowCount()):
+            item = self.table_model.item(row, COL_SERVER)
+            if item:
+                servers.add(item.text())
+
+        self.server_filter_combo.addItems(sorted(list(servers)))
+
+        idx = self.server_filter_combo.findText(cur_sel)
+        self.server_filter_combo.setCurrentIndex(idx if idx != -1 else 0)
+        self.server_filter_combo.blockSignals(False)
+
+    def update_server_ip_filter_combo(self):
+        cur_sel = self.server_ip_filter_combo.currentText()
+        self.server_ip_filter_combo.blockSignals(True)
+        self.server_ip_filter_combo.clear()
+        self.server_ip_filter_combo.addItem("All IPs")
+
+        ips = set()
+        for row in range(self.table_model.rowCount()):
+            item = self.table_model.item(row, COL_SERVER_IP)
+            if item:
+                ips.add(item.text())
+
+        self.server_ip_filter_combo.addItems(sorted(list(ips)))
+
+        idx = self.server_ip_filter_combo.findText(cur_sel)
+        self.server_ip_filter_combo.setCurrentIndex(idx if idx != -1 else 0)
+        self.server_ip_filter_combo.blockSignals(False)
+
     @Slot(str)
     def category_filter_changed(self, cat_name):
         self.current_category_filter = cat_name;
@@ -1508,6 +1595,14 @@ class MainWindow(QMainWindow):
     @Slot(str)
     def status_filter_changed(self, status_text):
         self.proxy_model.set_status_filter(status_text)
+
+    @Slot(str)
+    def server_filter_changed(self, server_text):
+        self.proxy_model.set_server_filter(server_text)
+
+    @Slot(str)
+    def server_ip_filter_changed(self, server_ip_text):
+        self.proxy_model.set_server_ip_filter(server_ip_text)
 
     @Slot(str)
     def on_search_text_changed(self, text):
@@ -1524,6 +1619,8 @@ class MainWindow(QMainWindow):
         except Exception as e: logging.error(f"Error loading entries: {e}"); QMessageBox.critical(self, "Load Error", f"Could not load: {e}")
 
         self.update_status_filter_combo()
+        self.update_server_filter_combo()
+        self.update_server_ip_filter_combo()
         self.proxy_model.invalidateFilter()
 
     def create_row_items(self, entry_data):
@@ -1637,6 +1734,8 @@ class MainWindow(QMainWindow):
 
         self.category_filter_combo.setEnabled(can_interact)
         self.status_filter_combo.setEnabled(can_interact)
+        self.server_filter_combo.setEnabled(can_interact)
+        self.server_ip_filter_combo.setEnabled(can_interact)
         self.search_edit.setEnabled(can_interact)
         self.exclude_na_button.setEnabled(can_interact)
 
