@@ -42,7 +42,8 @@ try:
         QFormLayout, QMessageBox, QDialogButtonBox, QLabel,
         QListWidget, QListWidgetItem, QInputDialog, QMenu,
         QAbstractItemView, QHeaderView, QStatusBar, QProgressBar,
-        QFileDialog, QTabWidget, QTableWidget, QTableWidgetItem, QStyle, QToolButton
+        QFileDialog, QTabWidget, QTableWidget, QTableWidgetItem, QStyle, QToolButton,
+        QSplitter
     )
     from PySide6.QtGui import QStandardItemModel, QStandardItem, QColor, QAction, QIcon, QKeySequence, QGuiApplication, QDesktopServices, QPalette
     from PySide6.QtCore import (
@@ -1240,7 +1241,8 @@ class PlaylistViewerDialog(QDialog):
     def __init__(self, server_url, username, password, parent=None):
         super().__init__(parent)
         self.setWindowTitle(f"Playlist Viewer - {server_url}")
-        self.resize(800, 600)
+        self.resize(1200, 800)
+        self.setWindowState(Qt.WindowMaximized)
         self.server_url = server_url
         self.username = username
         self.password = password
@@ -1320,39 +1322,15 @@ class PlaylistViewerDialog(QDialog):
              pass
 
     def setup_tab(self, tab_widget, title):
-        # Main Horizontal Layout
-        h_layout = QHBoxLayout(tab_widget)
-        h_layout.setContentsMargins(10, 10, 10, 10)
-        h_layout.setSpacing(10)
+        # Use QSplitter for resizable panels
+        main_layout = QVBoxLayout(tab_widget)
+        main_layout.setContentsMargins(10, 10, 10, 10)
+
+        splitter = QSplitter(Qt.Horizontal)
+        splitter.setHandleWidth(5)
 
         # --- Left Panel: Groups (QListWidget) ---
-        left_panel = QWidget()
-        left_layout = QVBoxLayout(left_panel)
-        left_layout.setContentsMargins(0, 0, 0, 0)
-
-        # Style the List Widget to look like the reference
         list_widget = QListWidget()
-        list_widget.setFixedWidth(250)
-        list_widget.setStyleSheet("""
-            QListWidget {
-                background-color: #f9f9f9;
-                border: 1px solid #ddd;
-                font-size: 13px;
-                color: #333;
-            }
-            QListWidget::item {
-                padding: 5px;
-                border-bottom: 1px solid #eee;
-            }
-            QListWidget::item:selected {
-                background-color: #e6f7ff;
-                color: #000;
-                border-left: 4px solid #1890ff; /* Blue indicator on left - moved to right in request? No, usually left. User asked for Right? */
-            }
-        """)
-        # User requested: "Can you move the blue row indicator in the table from the left side to the right side of each field?"
-        # Assuming this refers to the ListWidget selection indicator as standard tables highlight full rows.
-        # Let's try to simulate right-side indicator via stylesheet if possible or just border-right.
         list_widget.setStyleSheet("""
             QListWidget {
                 background-color: #f9f9f9;
@@ -1371,28 +1349,24 @@ class PlaylistViewerDialog(QDialog):
                 border-right: 4px solid #1890ff; /* Moved to right side per request */
             }
         """)
-
-        left_layout.addWidget(list_widget)
-        h_layout.addWidget(left_panel)
+        splitter.addWidget(list_widget)
 
         # --- Center Panel: Channels (QTableWidget) ---
-        center_panel = QWidget()
-        center_layout = QVBoxLayout(center_panel)
-        center_layout.setContentsMargins(0, 0, 0, 0)
-
         table = QTableWidget()
-        # Columns: Group (hidden ID), Name, Stream ID (hidden), Play Btn
-        # Actually user said: "instead of Row Number call it Group. Please add the Play button"
-        # Reference image cols: Number | Channel Name | Actions
-        # User request: Group | Name | Actions (with play button)
         table.setColumnCount(4)
         table.setHorizontalHeaderLabels(["Group", "Channel Name", "Actions", "StreamID"])
-        table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch) # Name stretches
+
+        # Adjust Column Modes for better visibility
+        header = table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeToContents) # Group
+        header.setSectionResizeMode(1, QHeaderView.Stretch) # Name gets most space
+        header.setSectionResizeMode(2, QHeaderView.ResizeToContents) # Actions (Button)
+
         table.setColumnHidden(3, True) # Hide StreamID
         table.setSelectionBehavior(QAbstractItemView.SelectRows)
         table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         table.setAlternatingRowColors(True)
-        table.verticalHeader().setVisible(False) # Hide vertical row numbers
+        table.verticalHeader().setVisible(False)
         table.setStyleSheet("""
             QTableWidget {
                 background-color: white;
@@ -1406,28 +1380,19 @@ class PlaylistViewerDialog(QDialog):
                 font-weight: bold;
             }
         """)
-
         table.doubleClicked.connect(self.play_stream_from_table_doubleclick)
-
-        center_layout.addWidget(table)
-        h_layout.addWidget(center_panel)
+        splitter.addWidget(table)
 
         # --- Right Panel: Video Player ---
-        right_panel = QWidget()
-        right_layout = QVBoxLayout(right_panel)
-        right_layout.setContentsMargins(0, 0, 0, 0)
-
-        # We need a unique video widget for each tab if we want them persistent,
-        # OR we share one player. Sharing one player logic is complex with tabs.
-        # Let's instantiate a QVideoWidget for each tab, but they will share the QMediaPlayer logic or have their own.
-        # Since QMediaPlayer can only output to one video output at a time easily without switching,
-        # we will create a QVideoWidget here.
+        # Container for video to manage size behavior in splitter
+        video_container = QWidget()
+        video_layout = QVBoxLayout(video_container)
+        video_layout.setContentsMargins(0, 0, 0, 0)
 
         if HAS_MULTIMEDIA:
             video_widget = QVideoWidget()
-            video_widget.setMinimumWidth(300)
             video_widget.setStyleSheet("background-color: black;")
-            right_layout.addWidget(video_widget)
+            video_layout.addWidget(video_widget)
 
             # Store this tab's video widget
             if title == "Live TV": self.live_video_widget = video_widget
@@ -1437,10 +1402,19 @@ class PlaylistViewerDialog(QDialog):
             label = QLabel("Video Player\n(Not Available)")
             label.setAlignment(Qt.AlignCenter)
             label.setStyleSheet("background-color: #eee; color: #888; border: 1px solid #ccc;")
-            label.setMinimumWidth(300)
-            right_layout.addWidget(label)
+            video_layout.addWidget(label)
 
-        h_layout.addWidget(right_panel)
+        splitter.addWidget(video_container)
+
+        # Set initial stretch factors (index, stretch)
+        splitter.setStretchFactor(0, 1) # List
+        splitter.setStretchFactor(1, 2) # Table
+        splitter.setStretchFactor(2, 3) # Video
+
+        # Set initial sizes explicitly to avoid cramped look if stretch doesn't kick in immediately
+        splitter.setSizes([250, 450, 500])
+
+        main_layout.addWidget(splitter)
 
         # Store references (updated for ListWidget)
         if title == "Live TV":
