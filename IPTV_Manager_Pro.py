@@ -41,9 +41,9 @@ try:
         QFormLayout, QMessageBox, QDialogButtonBox, QLabel,
         QListWidget, QListWidgetItem, QInputDialog, QMenu,
         QAbstractItemView, QHeaderView, QStatusBar, QProgressBar,
-        QFileDialog
+        QFileDialog, QTabWidget, QTableWidget, QTableWidgetItem
     )
-    from PySide6.QtGui import QStandardItemModel, QStandardItem, QColor, QAction, QIcon, QKeySequence, QGuiApplication
+    from PySide6.QtGui import QStandardItemModel, QStandardItem, QColor, QAction, QIcon, QKeySequence, QGuiApplication, QDesktopServices
     from PySide6.QtCore import (
         Qt, Slot, Signal, QObject, QThread, QModelIndex, QSortFilterProxyModel,
         QDateTime, QTimer
@@ -405,6 +405,39 @@ def get_stream_counts(server_base_url, username, password, session):
         except (requests.exceptions.RequestException, json.JSONDecodeError) as e:
             logging.warning(f"Could not fetch {cat_type} streams: {e}")
     return counts
+
+def get_live_streams_all(server_base_url, username, password, session=None):
+    if not session: session = requests.Session()
+    api_url = f"{server_base_url.rstrip('/')}/player_api.php?username={username}&password={password}&action=get_live_streams"
+    try:
+        response = session.get(api_url, timeout=10, headers=API_HEADERS)
+        response.raise_for_status()
+        return response.json()
+    except Exception as e:
+        logging.error(f"Error fetching live streams: {e}")
+        return []
+
+def get_vod_streams_all(server_base_url, username, password, session=None):
+    if not session: session = requests.Session()
+    api_url = f"{server_base_url.rstrip('/')}/player_api.php?username={username}&password={password}&action=get_vod_streams"
+    try:
+        response = session.get(api_url, timeout=10, headers=API_HEADERS)
+        response.raise_for_status()
+        return response.json()
+    except Exception as e:
+        logging.error(f"Error fetching VOD streams: {e}")
+        return []
+
+def get_series_all(server_base_url, username, password, session=None):
+    if not session: session = requests.Session()
+    api_url = f"{server_base_url.rstrip('/')}/player_api.php?username={username}&password={password}&action=get_series"
+    try:
+        response = session.get(api_url, timeout=10, headers=API_HEADERS)
+        response.raise_for_status()
+        return response.json()
+    except Exception as e:
+        logging.error(f"Error fetching series: {e}")
+        return []
 
 def check_account_status_detailed_api(server_base_url, username, password, session):
     processed_data = {
@@ -1116,6 +1149,85 @@ class BulkEditCommentsDialog(QDialog):
     def get_comment(self):
         return self.comment_edit.text()
 
+class PlaylistViewerDialog(QDialog):
+    def __init__(self, server_url, username, password, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"Playlist Viewer - {server_url}")
+        self.resize(800, 600)
+        self.server_url = server_url
+        self.username = username
+        self.password = password
+
+        layout = QVBoxLayout(self)
+
+        self.tabs = QTabWidget()
+        layout.addWidget(self.tabs)
+
+        self.live_tab = QWidget()
+        self.vod_tab = QWidget()
+        self.series_tab = QWidget()
+
+        self.setup_tab(self.live_tab, "Live TV")
+        self.setup_tab(self.vod_tab, "VOD")
+        self.setup_tab(self.series_tab, "Series")
+
+        self.tabs.addTab(self.live_tab, "Live TV")
+        self.tabs.addTab(self.vod_tab, "VOD")
+        self.tabs.addTab(self.series_tab, "Series")
+
+        # Open Source Button
+        btn_layout = QHBoxLayout()
+        self.open_source_btn = QPushButton("Open M3U in Browser")
+        self.open_source_btn.clicked.connect(self.open_source)
+        btn_layout.addStretch()
+        btn_layout.addWidget(self.open_source_btn)
+        layout.addLayout(btn_layout)
+
+        # Load data (could be threaded, simple direct call for MVP)
+        QTimer.singleShot(100, self.load_data)
+
+    def setup_tab(self, tab_widget, title):
+        layout = QVBoxLayout(tab_widget)
+        table = QTableWidget()
+        table.setColumnCount(3)
+        table.setHorizontalHeaderLabels(["ID", "Name", "Stream ID"])
+        table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        layout.addWidget(table)
+
+        # Store reference to table
+        if title == "Live TV": self.live_table = table
+        elif title == "VOD": self.vod_table = table
+        elif title == "Series": self.series_table = table
+
+    def load_data(self):
+        # Live
+        live_data = get_live_streams_all(self.server_url, self.username, self.password)
+        self.populate_table(self.live_table, live_data)
+
+        # VOD
+        vod_data = get_vod_streams_all(self.server_url, self.username, self.password)
+        self.populate_table(self.vod_table, vod_data)
+
+        # Series
+        series_data = get_series_all(self.server_url, self.username, self.password)
+        self.populate_table(self.series_table, series_data)
+
+    def populate_table(self, table, data_list):
+        if not data_list: return
+        table.setRowCount(len(data_list))
+        for row, item in enumerate(data_list):
+            # item is a dict
+            stream_id = str(item.get('stream_id', item.get('series_id', '')))
+            name = item.get('name', item.get('num', ''))
+
+            table.setItem(row, 0, QTableWidgetItem(str(row + 1)))
+            table.setItem(row, 1, QTableWidgetItem(name))
+            table.setItem(row, 2, QTableWidgetItem(stream_id))
+
+    def open_source(self):
+        m3u_url = f"{self.server_url}/get.php?username={self.username}&password={self.password}&type=m3u_plus&output=ts"
+        QDesktopServices.openUrl(m3u_url)
+
 
 # =============================================================================
 # API CHECKER WORKER
@@ -1429,9 +1541,11 @@ class MainWindow(QMainWindow):
         top_controls_layout.addWidget(self.export_csv_button)
 
         secondary_controls_layout = QHBoxLayout()
+        self.view_playlist_button = QPushButton("View Playlist/EPG")
         self.check_selected_button = QPushButton("Check Selected")
         self.check_all_button = QPushButton("Check All Visible")
         self.manage_categories_button = QPushButton("Categories...")
+        secondary_controls_layout.addWidget(self.view_playlist_button)
         secondary_controls_layout.addWidget(self.check_selected_button)
         secondary_controls_layout.addWidget(self.check_all_button)
         secondary_controls_layout.addStretch()
@@ -1441,6 +1555,7 @@ class MainWindow(QMainWindow):
         filter_controls_layout = QHBoxLayout()
         filter_controls_layout.addWidget(QLabel("Search:"))
         self.search_edit = QLineEdit()
+        self.search_edit.setClearButtonEnabled(True)
         self.search_edit.setPlaceholderText("Type to search...")
         filter_controls_layout.addWidget(self.search_edit)
         filter_controls_layout.addSpacing(10)
@@ -1534,6 +1649,7 @@ class MainWindow(QMainWindow):
         self.import_url_button.clicked.connect(self.import_from_url_action)
         self.import_file_button.clicked.connect(self.import_from_file_action)
         self.manage_categories_button.clicked.connect(self.manage_categories_action)
+        self.view_playlist_button.clicked.connect(self.view_playlist_action)
         self.check_selected_button.clicked.connect(self.check_selected_entries_action)
         self.check_all_button.clicked.connect(self.check_all_entries_action)
         self.export_clipboard_button.clicked.connect(self.export_current_to_clipboard)
@@ -1755,6 +1871,7 @@ class MainWindow(QMainWindow):
         can_interact = not self._is_checking_api
 
         self.edit_button.setEnabled(selected_row_count == 1 and can_interact)
+        self.view_playlist_button.setEnabled(selected_row_count == 1 and can_interact)
         self.delete_button.setEnabled(has_selection and can_interact)
         self.bulk_edit_button.setEnabled(has_selection and can_interact)
         self.bulk_edit_comments_button.setEnabled(has_selection and can_interact)
@@ -1805,6 +1922,27 @@ class MainWindow(QMainWindow):
 
         diag = EntryDialog(entry_id=entry_id, parent=self)
         if diag.exec(): self.refresh_row_by_id(entry_id); self.update_category_filter_combo()
+
+    @Slot()
+    def view_playlist_action(self):
+        current_proxy_index = self.table_view.currentIndex()
+        if not current_proxy_index.isValid(): return
+
+        src_idx = self.proxy_model.mapToSource(current_proxy_index)
+        entry_id_item = self.table_model.itemFromIndex(src_idx.siblingAtColumn(COL_ID))
+        if not entry_id_item: return
+        entry_id = entry_id_item.data(Qt.UserRole)
+
+        entry = get_entry_by_id(entry_id)
+        if not entry: return
+
+        account_type = entry['account_type'] if entry['account_type'] is not None else 'xc'
+
+        if account_type == 'xc':
+            dialog = PlaylistViewerDialog(entry['server_base_url'], entry['username'], entry['password'], self)
+            dialog.exec()
+        else:
+            QMessageBox.information(self, "Info", "Playlist viewer only supports Xtream Codes API accounts currently.")
 
     @Slot(QStandardItem)
     def on_table_item_changed(self, item):
