@@ -177,6 +177,11 @@ def initialize_database():
         except sqlite3.OperationalError:
             logging.info("Adding 'server_ip' column to entries table.")
             cursor.execute("ALTER TABLE entries ADD COLUMN server_ip TEXT")
+        try:
+            cursor.execute("SELECT service FROM entries LIMIT 1")
+        except sqlite3.OperationalError:
+            logging.info("Adding 'service' column to entries table.")
+            cursor.execute("ALTER TABLE entries ADD COLUMN service TEXT")
 
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS categories (
@@ -195,28 +200,28 @@ def initialize_database():
     finally:
         if conn: conn.close()
 
-def add_entry(name, category, server_url, username, password, account_type='xc', mac_address=None, portal_url=None, comments=None):
+def add_entry(name, category, server_url, username, password, account_type='xc', mac_address=None, portal_url=None, comments=None, service=None):
     conn = get_db_connection()
     try:
         cursor = conn.execute('''
-            INSERT INTO entries (name, category, server_base_url, username, password, account_type, mac_address, portal_url, comments)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (name, category, server_url, username, password, account_type, mac_address, portal_url, comments))
+            INSERT INTO entries (name, category, server_base_url, username, password, account_type, mac_address, portal_url, comments, service)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (name, category, server_url, username, password, account_type, mac_address, portal_url, comments, service))
         conn.commit()
         entry_id = cursor.lastrowid
         logging.info(f"Added entry: {name} (ID: {entry_id}, Type: {account_type})")
         return entry_id
     finally: conn.close()
 
-def update_entry(entry_id, name, category, server_url, username, password, account_type='xc', mac_address=None, portal_url=None, comments=None):
+def update_entry(entry_id, name, category, server_url, username, password, account_type='xc', mac_address=None, portal_url=None, comments=None, service=None):
     conn = get_db_connection()
     try:
         conn.execute('''
             UPDATE entries
             SET name = ?, category = ?, server_base_url = ?, username = ?, password = ?,
-                account_type = ?, mac_address = ?, portal_url = ?, comments = ?
+                account_type = ?, mac_address = ?, portal_url = ?, comments = ?, service = ?
             WHERE id = ?
-        ''', (name, category, server_url, username, password, account_type, mac_address, portal_url, comments, entry_id))
+        ''', (name, category, server_url, username, password, account_type, mac_address, portal_url, comments, service, entry_id))
         conn.commit()
         logging.info(f"Updated entry ID: {entry_id} (Type: {account_type})")
     finally: conn.close()
@@ -289,6 +294,15 @@ def update_entry_comment(entry_id, new_comment):
         conn.execute("UPDATE entries SET comments = ? WHERE id = ?", (new_comment, entry_id))
         conn.commit()
         logging.info(f"Updated comment for entry ID: {entry_id}")
+    finally:
+        conn.close()
+
+def update_entry_service(entry_id, new_service):
+    conn = get_db_connection()
+    try:
+        conn.execute("UPDATE entries SET service = ? WHERE id = ?", (new_service, entry_id))
+        conn.commit()
+        logging.info(f"Updated service for entry ID: {entry_id}")
     finally:
         conn.close()
 
@@ -830,6 +844,7 @@ class EntryDialog(QDialog):
         self.populate_categories()
 
         self.comments_edit = QLineEdit()
+        self.service_edit = QLineEdit()
 
         self.account_type_combo = QComboBox()
         self.account_type_combo.addItems(["Xtream Codes API", "Stalker Portal"])
@@ -853,6 +868,7 @@ class EntryDialog(QDialog):
         form_layout.addRow("Display Name:", self.name_edit)
         form_layout.addRow("Category:", self.category_combo)
         form_layout.addRow("Comments:", self.comments_edit)
+        form_layout.addRow("Service:", self.service_edit)
         form_layout.addRow("Account Type:", self.account_type_combo)
 
         # Add XC fields (will be shown/hidden)
@@ -906,6 +922,8 @@ class EntryDialog(QDialog):
                 self.name_edit.setText(entry['name'])
                 if 'comments' in entry.keys():
                     self.comments_edit.setText(entry['comments'] or "")
+                if 'service' in entry.keys():
+                    self.service_edit.setText(entry['service'] or "")
                 # entry is an sqlite3.Row object.
                 current_account_type = entry['account_type'] if entry['account_type'] is not None else 'xc'
                 type_display_name = "Stalker Portal" if current_account_type == 'stalker' else "Xtream Codes API"
@@ -938,6 +956,7 @@ class EntryDialog(QDialog):
             "name": self.name_edit.text().strip(),
             "category": self.category_combo.currentText(),
             "comments": self.comments_edit.text().strip(),
+            "service": self.service_edit.text().strip(),
             "account_type_text": self.account_type_combo.currentText()
         }
         if data["account_type_text"] == "Stalker Portal":
@@ -993,11 +1012,11 @@ class EntryDialog(QDialog):
             if self.is_edit_mode:
                 update_entry(self.entry_id, data['name'], data['category'],
                              data['server_url'], data['username'], data['password'],
-                             data['account_type'], data['mac_address'], data['portal_url'], data['comments'])
+                             data['account_type'], data['mac_address'], data['portal_url'], data['comments'], data['service'])
             else:
                 add_entry(data['name'], data['category'],
                           data['server_url'], data['username'], data['password'],
-                          data['account_type'], data['mac_address'], data['portal_url'], data['comments'])
+                          data['account_type'], data['mac_address'], data['portal_url'], data['comments'], data['service'])
             self.accept()
         except Exception as e: logging.error(f"Error saving entry: {e}"); QMessageBox.critical(self, "Database Error", f"Could not save: {e}")
 
@@ -1182,6 +1201,30 @@ class BulkEditCommentsDialog(QDialog):
 
     def get_comment(self):
         return self.comment_edit.text()
+
+class BulkEditServiceDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Bulk Edit Service")
+        self.setMinimumWidth(400)
+        self.setWindowModality(Qt.WindowModal)
+
+        layout = QVBoxLayout(self)
+        form_layout = QFormLayout()
+
+        self.service_edit = QLineEdit()
+        self.service_edit.setPlaceholderText("Enter new service for selected entries")
+
+        form_layout.addRow("New Service:", self.service_edit)
+        layout.addLayout(form_layout)
+
+        self.button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        self.button_box.accepted.connect(self.accept)
+        self.button_box.rejected.connect(self.reject)
+        layout.addWidget(self.button_box)
+
+    def get_service(self):
+        return self.service_edit.text()
 
 class PlaylistViewerDialog(QDialog):
     def __init__(self, server_url, username, password, parent=None):
@@ -1487,7 +1530,7 @@ class ApiCheckerWorker(QObject):
 # CUSTOM PROXY MODEL FOR FILTERING
 # =============================================================================
 COL_ID, COL_NAME, COL_CATEGORY, COL_COMMENTS, COL_STATUS, COL_CHANNELS, COL_MOVIES, COL_SERIES, COL_EXPIRY, \
-COL_ACTIVE_CONN, COL_MAX_CONN, COL_LAST_CHECKED, COL_SERVER, COL_SERVER_IP, COL_USER, COL_PASSWORD, COL_MSG = range(17)
+COL_ACTIVE_CONN, COL_MAX_CONN, COL_LAST_CHECKED, COL_SERVER, COL_SERVER_IP, COL_USER, COL_PASSWORD, COL_MSG, COL_SERVICE = range(18)
 
 class EntryFilterProxyModel(QSortFilterProxyModel):
     def __init__(self, parent=None):
@@ -1559,7 +1602,7 @@ class EntryFilterProxyModel(QSortFilterProxyModel):
         search_match = True
         if self._search_text:
             search_match = False
-            search_columns = [COL_NAME, COL_CATEGORY, COL_COMMENTS, COL_STATUS, COL_SERVER, COL_SERVER_IP, COL_USER, COL_MSG]
+            search_columns = [COL_NAME, COL_CATEGORY, COL_COMMENTS, COL_STATUS, COL_SERVER, COL_SERVER_IP, COL_USER, COL_MSG, COL_SERVICE]
             for col in search_columns:
                 idx = self.sourceModel().index(source_row, col, source_parent)
                 data = self.sourceModel().data(idx)
@@ -1581,7 +1624,7 @@ class EntryFilterProxyModel(QSortFilterProxyModel):
 # =============================================================================
 # MAIN APPLICATION WINDOW
 # =============================================================================
-COLUMN_HEADERS = ["ID", "Name", "Category", "Comments", "Status", "Channels", "Movies", "Series", "Expires", "Active", "Max", "Last Checked", "Server", "Server IP", "User / MAC", "Password", "Message"]
+COLUMN_HEADERS = ["ID", "Name", "Category", "Comments", "Status", "Channels", "Movies", "Series", "Expires", "Active", "Max", "Last Checked", "Server", "Server IP", "User / MAC", "Password", "Message", "Service"]
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -1644,6 +1687,7 @@ class MainWindow(QMainWindow):
         self.delete_duplicates_button = QPushButton("Delete Duplicates")
         self.bulk_edit_button = QPushButton("Bulk Edit")
         self.bulk_edit_comments_button = QPushButton("Bulk Edit Comments")
+        self.bulk_edit_service_button = QPushButton("Bulk Edit Service")
         self.import_url_button = QPushButton("Import URL")
         self.import_file_button = QPushButton("Import File")
 
@@ -1653,6 +1697,7 @@ class MainWindow(QMainWindow):
         top_controls_layout.addWidget(self.delete_duplicates_button)
         top_controls_layout.addWidget(self.bulk_edit_button)
         top_controls_layout.addWidget(self.bulk_edit_comments_button)
+        top_controls_layout.addWidget(self.bulk_edit_service_button)
         top_controls_layout.addSpacing(10)
         top_controls_layout.addWidget(self.import_url_button)
         top_controls_layout.addWidget(self.import_file_button)
@@ -1752,6 +1797,8 @@ class MainWindow(QMainWindow):
         self.table_view.setColumnWidth(COL_USER, 150)
         header.setSectionResizeMode(COL_PASSWORD, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(COL_MSG, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(COL_SERVICE, QHeaderView.Interactive)
+        self.table_view.setColumnWidth(COL_SERVICE, 150)
         main_layout.addWidget(self.table_view)
         self.setCentralWidget(main_widget)
         self.status_bar = QStatusBar()
@@ -1767,6 +1814,7 @@ class MainWindow(QMainWindow):
         self.delete_duplicates_button.clicked.connect(self.delete_duplicates_action)
         self.bulk_edit_button.clicked.connect(self.bulk_edit_category_action)
         self.bulk_edit_comments_button.clicked.connect(self.bulk_edit_comments_action)
+        self.bulk_edit_service_button.clicked.connect(self.bulk_edit_service_action)
         self.import_url_button.clicked.connect(self.import_from_url_action)
         self.import_file_button.clicked.connect(self.import_from_file_action)
         self.manage_categories_button.clicked.connect(self.manage_categories_action)
@@ -1950,8 +1998,14 @@ class MainWindow(QMainWindow):
         api_msg = entry_data['api_message'] if entry_data['api_message'] is not None else ""
         items.append(QStandardItem(api_msg))
 
+        # Add Service column item
+        service_text = ""
+        if 'service' in entry_data.keys() and entry_data['service']:
+            service_text = entry_data['service']
+        items.append(QStandardItem(service_text))
+
         for i, item in enumerate(items):
-            if i == COL_COMMENTS:
+            if i == COL_COMMENTS or i == COL_SERVICE:
                 item.setFlags(item.flags() | Qt.ItemIsEditable)
             else:
                 item.setFlags(item.flags() & ~Qt.ItemIsEditable)
@@ -1996,6 +2050,7 @@ class MainWindow(QMainWindow):
         self.delete_button.setEnabled(has_selection and can_interact)
         self.bulk_edit_button.setEnabled(has_selection and can_interact)
         self.bulk_edit_comments_button.setEnabled(has_selection and can_interact)
+        self.bulk_edit_service_button.setEnabled(has_selection and can_interact)
         self.check_selected_button.setEnabled(has_selection and can_interact)
         self.export_txt_button.setEnabled(has_selection and can_interact)
         self.export_csv_button.setEnabled(self.proxy_model.rowCount() > 0 and can_interact)
@@ -2032,8 +2087,8 @@ class MainWindow(QMainWindow):
             if not sel_proxied: return
             current_proxy_index = sel_proxied[0]
 
-        # Prevent opening edit dialog if editing a comment inline
-        if current_proxy_index.column() == COL_COMMENTS:
+        # Prevent opening edit dialog if editing a comment or service inline
+        if current_proxy_index.column() == COL_COMMENTS or current_proxy_index.column() == COL_SERVICE:
             return
 
         src_idx = self.proxy_model.mapToSource(current_proxy_index)
@@ -2074,6 +2129,13 @@ class MainWindow(QMainWindow):
                 entry_id = id_item.data(Qt.UserRole)
                 new_comment = item.text()
                 update_entry_comment(entry_id, new_comment)
+        elif item.column() == COL_SERVICE:
+            row = item.row()
+            id_item = self.table_model.item(row, COL_ID)
+            if id_item:
+                entry_id = id_item.data(Qt.UserRole)
+                new_service = item.text()
+                update_entry_service(entry_id, new_service)
 
     @Slot()
     def bulk_edit_category_action(self):
@@ -2112,6 +2174,25 @@ class MainWindow(QMainWindow):
             except Exception as e:
                 logging.error(f"Error bulk updating comments: {e}")
                 QMessageBox.critical(self, "Database Error", f"Could not update comments: {e}")
+
+    @Slot()
+    def bulk_edit_service_action(self):
+        selected_ids = self.get_selected_entry_ids()
+        if not selected_ids:
+            QMessageBox.information(self, "Bulk Edit Service", "No entries selected.")
+            return
+
+        dialog = BulkEditServiceDialog(parent=self)
+        if dialog.exec():
+            new_service = dialog.get_service()
+            try:
+                for entry_id in selected_ids:
+                    update_entry_service(entry_id, new_service)
+                self.load_entries_to_table()
+                QMessageBox.information(self, "Success", f"Service updated for {len(selected_ids)} entries.")
+            except Exception as e:
+                logging.error(f"Error bulk updating service: {e}")
+                QMessageBox.critical(self, "Database Error", f"Could not update service: {e}")
 
     @Slot()
     def delete_entry_action(self):
@@ -2748,6 +2829,15 @@ class MainWindow(QMainWindow):
 if __name__ == "__main__":
     logging.getLogger().setLevel(logging.DEBUG)
     logging.info("Application starting with DEBUG level logging.")
+
+    # Fix for Windows Taskbar Icon
+    if sys.platform == 'win32':
+        try:
+            import ctypes
+            myappid = f"MyCompany.IPTVManagerPro.{APP_VERSION}" # Arbitrary string
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
+        except Exception as e:
+            logging.error(f"Failed to set AppUserModelID: {e}")
 
     if hasattr(Qt, 'AA_EnableHighDpiScaling'):
         QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
