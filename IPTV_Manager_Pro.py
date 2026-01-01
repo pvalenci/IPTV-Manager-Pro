@@ -42,12 +42,12 @@ try:
         QFormLayout, QMessageBox, QDialogButtonBox, QLabel,
         QListWidget, QListWidgetItem, QInputDialog, QMenu,
         QAbstractItemView, QHeaderView, QStatusBar, QProgressBar,
-        QFileDialog, QTabWidget, QTableWidget, QTableWidgetItem
+        QFileDialog, QTabWidget, QTableWidget, QTableWidgetItem, QStyle, QToolButton
     )
-    from PySide6.QtGui import QStandardItemModel, QStandardItem, QColor, QAction, QIcon, QKeySequence, QGuiApplication, QDesktopServices
+    from PySide6.QtGui import QStandardItemModel, QStandardItem, QColor, QAction, QIcon, QKeySequence, QGuiApplication, QDesktopServices, QPalette
     from PySide6.QtCore import (
         Qt, Slot, Signal, QObject, QThread, QModelIndex, QSortFilterProxyModel,
-        QDateTime, QTimer, QUrl
+        QDateTime, QTimer, QUrl, QSize
     )
 
     # Attempt to import QtMultimedia (optional, for embedded player)
@@ -1832,6 +1832,49 @@ class EntryFilterProxyModel(QSortFilterProxyModel):
                     return False
         return True
 
+class ClearableComboBox(QComboBox):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+
+        self.clear_button = QToolButton(self)
+        # Use a standard close icon (x)
+        self.clear_button.setIcon(self.style().standardIcon(QStyle.SP_DialogResetButton))
+        # Fallback to text if no icon
+        if self.clear_button.icon().isNull():
+             self.clear_button.setText("x")
+
+        self.clear_button.setCursor(Qt.ArrowCursor)
+        self.clear_button.setStyleSheet("QToolButton { border: none; padding: 0px; background-color: transparent; }")
+        self.clear_button.hide()
+        self.clear_button.clicked.connect(self.clear_selection)
+
+        self.currentIndexChanged.connect(self.update_clear_button)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        # Position the button to the right, inside the frame
+        # Adjust size and position
+        sz = self.clear_button.sizeHint()
+        frame_width = self.style().pixelMetric(QStyle.PM_DefaultFrameWidth)
+        # We need to account for the dropdown arrow width
+        arrow_width = 20 # Approximate
+
+        # Position slightly to the left of the arrow
+        x = self.rect().right() - frame_width - arrow_width - sz.width()
+        y = (self.rect().bottom() + 1 - sz.height()) // 2
+
+        self.clear_button.move(x, y)
+
+    def update_clear_button(self):
+        # Show button if index > 0 (assuming 0 is "All ...")
+        if self.currentIndex() > 0:
+            self.clear_button.show()
+        else:
+            self.clear_button.hide()
+
+    def clear_selection(self):
+        self.setCurrentIndex(0)
+
 # =============================================================================
 # MAIN APPLICATION WINDOW
 # =============================================================================
@@ -1893,7 +1936,6 @@ class MainWindow(QMainWindow):
 
         top_controls_layout = QHBoxLayout()
         self.add_button = QPushButton("Add Entry")
-        self.edit_button = QPushButton("Edit Selected")
         self.delete_button = QPushButton("Delete Selected")
         self.delete_duplicates_button = QPushButton("Delete Duplicates")
         self.bulk_edit_button = QPushButton("Bulk Edit")
@@ -1903,7 +1945,6 @@ class MainWindow(QMainWindow):
         self.import_file_button = QPushButton("Import File")
 
         top_controls_layout.addWidget(self.add_button)
-        top_controls_layout.addWidget(self.edit_button)
         top_controls_layout.addWidget(self.delete_button)
         top_controls_layout.addWidget(self.delete_duplicates_button)
         top_controls_layout.addWidget(self.bulk_edit_button)
@@ -1948,22 +1989,22 @@ class MainWindow(QMainWindow):
         filter_controls_layout.addWidget(self.search_edit)
         filter_controls_layout.addSpacing(10)
         filter_controls_layout.addWidget(QLabel("Category:"))
-        self.category_filter_combo = QComboBox()
+        self.category_filter_combo = ClearableComboBox()
         self.category_filter_combo.setMinimumWidth(150)
         filter_controls_layout.addWidget(self.category_filter_combo)
         filter_controls_layout.addSpacing(10)
         filter_controls_layout.addWidget(QLabel("Status:"))
-        self.status_filter_combo = QComboBox()
+        self.status_filter_combo = ClearableComboBox()
         self.status_filter_combo.setMinimumWidth(150)
         filter_controls_layout.addWidget(self.status_filter_combo)
         filter_controls_layout.addSpacing(10)
         filter_controls_layout.addWidget(QLabel("Server:"))
-        self.server_filter_combo = QComboBox()
+        self.server_filter_combo = ClearableComboBox()
         self.server_filter_combo.setMinimumWidth(150)
         filter_controls_layout.addWidget(self.server_filter_combo)
         filter_controls_layout.addSpacing(10)
         filter_controls_layout.addWidget(QLabel("Server IP:"))
-        self.server_ip_filter_combo = QComboBox()
+        self.server_ip_filter_combo = ClearableComboBox()
         self.server_ip_filter_combo.setMinimumWidth(150)
         filter_controls_layout.addWidget(self.server_ip_filter_combo)
         self.exclude_na_button = QPushButton("Exclude N/A")
@@ -2020,7 +2061,6 @@ class MainWindow(QMainWindow):
         self.status_bar.addPermanentWidget(self.progress_bar)
 
         self.add_button.clicked.connect(self.add_entry_action)
-        self.edit_button.clicked.connect(self.edit_entry_action)
         self.delete_button.clicked.connect(self.delete_entry_action)
         self.delete_duplicates_button.clicked.connect(self.delete_duplicates_action)
         self.bulk_edit_button.clicked.connect(self.bulk_edit_category_action)
@@ -2256,7 +2296,6 @@ class MainWindow(QMainWindow):
 
         can_interact = not self._is_checking_api
 
-        self.edit_button.setEnabled(selected_row_count == 1 and can_interact)
         self.view_playlist_button.setEnabled(selected_row_count == 1 and can_interact)
         self.delete_button.setEnabled(has_selection and can_interact)
         self.bulk_edit_button.setEnabled(has_selection and can_interact)
