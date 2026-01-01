@@ -47,8 +47,18 @@ try:
     from PySide6.QtGui import QStandardItemModel, QStandardItem, QColor, QAction, QIcon, QKeySequence, QGuiApplication, QDesktopServices
     from PySide6.QtCore import (
         Qt, Slot, Signal, QObject, QThread, QModelIndex, QSortFilterProxyModel,
-        QDateTime, QTimer
+        QDateTime, QTimer, QUrl
     )
+
+    # Attempt to import QtMultimedia (optional, for embedded player)
+    try:
+        from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
+        from PySide6.QtMultimediaWidgets import QVideoWidget
+        HAS_MULTIMEDIA = True
+    except ImportError:
+        HAS_MULTIMEDIA = False
+        print("Warning: QtMultimedia not found. Embedded player will be disabled.")
+
 except ImportError:
     print("\nError: Required library 'PySide6' not found. Please install it: pip install PySide6", file=sys.stderr)
     sys.exit(1)
@@ -1293,73 +1303,267 @@ class PlaylistViewerDialog(QDialog):
         # Store references
         if title == "Live TV":
             self.live_table = table
-            self.live_group_combo = combo
-            self.live_group_combo.currentIndexChanged.connect(self.filter_live_streams)
+            self.live_group_list = list_widget
+            self.live_group_list.currentItemChanged.connect(self.filter_live_streams)
         elif title == "VOD":
             self.vod_table = table
-            self.vod_group_combo = combo
-            self.vod_group_combo.currentIndexChanged.connect(self.filter_vod_streams)
+            self.vod_group_list = list_widget
+            self.vod_group_list.currentItemChanged.connect(self.filter_vod_streams)
         elif title == "Series":
             self.series_table = table
-            self.series_group_combo = combo
-            self.series_group_combo.currentIndexChanged.connect(self.filter_series_streams)
+            self.series_group_list = list_widget
+            self.series_group_list.currentItemChanged.connect(self.filter_series_streams)
+
+        # Connect Video Widget if multimedia is available
+        if HAS_MULTIMEDIA and self.media_player:
+             # Just ensures the video widget is ready, no specific connect needed here yet
+             pass
+
+    def setup_tab(self, tab_widget, title):
+        # Main Horizontal Layout
+        h_layout = QHBoxLayout(tab_widget)
+        h_layout.setContentsMargins(10, 10, 10, 10)
+        h_layout.setSpacing(10)
+
+        # --- Left Panel: Groups (QListWidget) ---
+        left_panel = QWidget()
+        left_layout = QVBoxLayout(left_panel)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+
+        # Style the List Widget to look like the reference
+        list_widget = QListWidget()
+        list_widget.setFixedWidth(250)
+        list_widget.setStyleSheet("""
+            QListWidget {
+                background-color: #f9f9f9;
+                border: 1px solid #ddd;
+                font-size: 13px;
+                color: #333;
+            }
+            QListWidget::item {
+                padding: 5px;
+                border-bottom: 1px solid #eee;
+            }
+            QListWidget::item:selected {
+                background-color: #e6f7ff;
+                color: #000;
+                border-left: 4px solid #1890ff; /* Blue indicator on left - moved to right in request? No, usually left. User asked for Right? */
+            }
+        """)
+        # User requested: "Can you move the blue row indicator in the table from the left side to the right side of each field?"
+        # Assuming this refers to the ListWidget selection indicator as standard tables highlight full rows.
+        # Let's try to simulate right-side indicator via stylesheet if possible or just border-right.
+        list_widget.setStyleSheet("""
+            QListWidget {
+                background-color: #f9f9f9;
+                border: 1px solid #ddd;
+                font-size: 13px;
+                color: #333;
+            }
+            QListWidget::item {
+                padding: 5px;
+                border-bottom: 1px solid #eee;
+            }
+            QListWidget::item:selected {
+                background-color: #e6f7ff;
+                color: #000;
+                border-left: none;
+                border-right: 4px solid #1890ff; /* Moved to right side per request */
+            }
+        """)
+
+        left_layout.addWidget(list_widget)
+        h_layout.addWidget(left_panel)
+
+        # --- Center Panel: Channels (QTableWidget) ---
+        center_panel = QWidget()
+        center_layout = QVBoxLayout(center_panel)
+        center_layout.setContentsMargins(0, 0, 0, 0)
+
+        table = QTableWidget()
+        # Columns: Group (hidden ID), Name, Stream ID (hidden), Play Btn
+        # Actually user said: "instead of Row Number call it Group. Please add the Play button"
+        # Reference image cols: Number | Channel Name | Actions
+        # User request: Group | Name | Actions (with play button)
+        table.setColumnCount(4)
+        table.setHorizontalHeaderLabels(["Group", "Channel Name", "Actions", "StreamID"])
+        table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch) # Name stretches
+        table.setColumnHidden(3, True) # Hide StreamID
+        table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        table.setAlternatingRowColors(True)
+        table.verticalHeader().setVisible(False) # Hide vertical row numbers
+        table.setStyleSheet("""
+            QTableWidget {
+                background-color: white;
+                gridline-color: #eee;
+                border: 1px solid #ddd;
+            }
+            QHeaderView::section {
+                background-color: #f2f2f2;
+                padding: 4px;
+                border: 1px solid #ddd;
+                font-weight: bold;
+            }
+        """)
+
+        table.doubleClicked.connect(self.play_stream_from_table_doubleclick)
+
+        center_layout.addWidget(table)
+        h_layout.addWidget(center_panel)
+
+        # --- Right Panel: Video Player ---
+        right_panel = QWidget()
+        right_layout = QVBoxLayout(right_panel)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+
+        # We need a unique video widget for each tab if we want them persistent,
+        # OR we share one player. Sharing one player logic is complex with tabs.
+        # Let's instantiate a QVideoWidget for each tab, but they will share the QMediaPlayer logic or have their own.
+        # Since QMediaPlayer can only output to one video output at a time easily without switching,
+        # we will create a QVideoWidget here.
+
+        if HAS_MULTIMEDIA:
+            video_widget = QVideoWidget()
+            video_widget.setMinimumWidth(300)
+            video_widget.setStyleSheet("background-color: black;")
+            right_layout.addWidget(video_widget)
+
+            # Store this tab's video widget
+            if title == "Live TV": self.live_video_widget = video_widget
+            elif title == "VOD": self.vod_video_widget = video_widget
+            elif title == "Series": self.series_video_widget = video_widget
+        else:
+            label = QLabel("Video Player\n(Not Available)")
+            label.setAlignment(Qt.AlignCenter)
+            label.setStyleSheet("background-color: #eee; color: #888; border: 1px solid #ccc;")
+            label.setMinimumWidth(300)
+            right_layout.addWidget(label)
+
+        h_layout.addWidget(right_panel)
+
+        # Store references (updated for ListWidget)
+        if title == "Live TV":
+            self.live_table = table
+            self.live_group_list = list_widget
+            self.live_group_list.currentItemChanged.connect(self.filter_live_streams)
+        elif title == "VOD":
+            self.vod_table = table
+            self.vod_group_list = list_widget
+            self.vod_group_list.currentItemChanged.connect(self.filter_vod_streams)
+        elif title == "Series":
+            self.series_table = table
+            self.series_group_list = list_widget
+            self.series_group_list.currentItemChanged.connect(self.filter_series_streams)
 
     def load_data(self):
-        # Fetch Categories First
+        # Fetch Categories
         live_cats = get_live_categories(self.server_url, self.username, self.password)
         vod_cats = get_vod_categories(self.server_url, self.username, self.password)
         series_cats = get_series_categories(self.server_url, self.username, self.password)
 
-        self.populate_combo(self.live_group_combo, live_cats)
-        self.populate_combo(self.vod_group_combo, vod_cats)
-        self.populate_combo(self.series_group_combo, series_cats)
+        self.populate_list(self.live_group_list, live_cats)
+        self.populate_list(self.vod_group_list, vod_cats)
+        self.populate_list(self.series_group_list, series_cats)
 
         # Fetch Streams
         self.live_streams = get_live_streams_all(self.server_url, self.username, self.password)
         self.vod_streams = get_vod_streams_all(self.server_url, self.username, self.password)
         self.series_streams = get_series_all(self.server_url, self.username, self.password)
 
-        # Initial Populate (All)
-        self.filter_live_streams()
-        self.filter_vod_streams()
-        self.filter_series_streams()
+        # Map categories for quick lookup (ID -> Name)
+        self.live_cat_map = {str(c.get('category_id')): c.get('category_name') for c in live_cats}
+        self.vod_cat_map = {str(c.get('category_id')): c.get('category_name') for c in vod_cats}
+        self.series_cat_map = {str(c.get('category_id')): c.get('category_name') for c in series_cats}
 
-    def populate_combo(self, combo, categories):
-        combo.clear()
-        combo.addItem("All Categories", None)
+        # Initial Populate
+        # Select first item to trigger filter
+        if self.live_group_list.count() > 0: self.live_group_list.setCurrentRow(0)
+        if self.vod_group_list.count() > 0: self.vod_group_list.setCurrentRow(0)
+        if self.series_group_list.count() > 0: self.series_group_list.setCurrentRow(0)
+
+        # Init Player if available
+        if HAS_MULTIMEDIA:
+            self.media_player = QMediaPlayer()
+            self.audio_output = QAudioOutput()
+            self.media_player.setAudioOutput(self.audio_output)
+            # We need to switch video output when tabs change
+            self.tabs.currentChanged.connect(self.on_tab_changed)
+            # Set initial output
+            self.on_tab_changed(self.tabs.currentIndex())
+
+    def on_tab_changed(self, index):
+        if not HAS_MULTIMEDIA: return
+        self.media_player.stop() # Stop playback on tab switch
+        # Set video output to the widget in the current tab
+        if index == 0: # Live
+            self.media_player.setVideoOutput(self.live_video_widget)
+        elif index == 1: # VOD
+            self.media_player.setVideoOutput(self.vod_video_widget)
+        elif index == 2: # Series
+            self.media_player.setVideoOutput(self.series_video_widget)
+
+    def populate_list(self, list_widget, categories):
+        list_widget.clear()
+        # Add "All Categories"
+        item_all = QListWidgetItem("All Categories")
+        item_all.setData(Qt.UserRole, None)
+        list_widget.addItem(item_all)
+
         for cat in categories:
-            combo.addItem(cat.get('category_name', 'Unknown'), cat.get('category_id'))
+            name = cat.get('category_name', 'Unknown')
+            cid = cat.get('category_id')
+            item = QListWidgetItem(name)
+            item.setData(Qt.UserRole, cid)
+            list_widget.addItem(item)
 
-    def populate_table(self, table, data_list):
+    def populate_table(self, table, data_list, cat_map):
         table.setRowCount(0)
         if not data_list: return
         table.setRowCount(len(data_list))
+
         for row, item in enumerate(data_list):
             stream_id = str(item.get('stream_id', item.get('series_id', '')))
             name = item.get('name', item.get('num', ''))
             cat_id = str(item.get('category_id', ''))
+            cat_name = cat_map.get(cat_id, "Unknown")
 
-            table.setItem(row, 0, QTableWidgetItem(str(row + 1)))
+            # Group Name
+            table.setItem(row, 0, QTableWidgetItem(cat_name))
+            # Channel Name
             table.setItem(row, 1, QTableWidgetItem(name))
-            table.setItem(row, 2, QTableWidgetItem(stream_id))
-            table.setItem(row, 3, QTableWidgetItem(cat_id))
+
+            # Play Button (Action)
+            btn = QPushButton()
+            btn.setIcon(QIcon.fromTheme("media-playback-start")) # Try system theme or just text
+            if btn.icon().isNull():
+                btn.setText("▶")
+            btn.setFixedWidth(40)
+            btn.clicked.connect(lambda checked, r=row, t=table: self.play_stream_from_button(r, t))
+            table.setCellWidget(row, 2, btn)
+
+            # Stream ID (Hidden)
+            table.setItem(row, 3, QTableWidgetItem(stream_id))
 
     def filter_live_streams(self):
-        self._filter_table(self.live_table, self.live_streams, self.live_group_combo)
+        self._filter_and_update(self.live_table, self.live_streams, self.live_group_list, self.live_cat_map)
 
     def filter_vod_streams(self):
-        self._filter_table(self.vod_table, self.vod_streams, self.vod_group_combo)
+        self._filter_and_update(self.vod_table, self.vod_streams, self.vod_group_list, self.vod_cat_map)
 
     def filter_series_streams(self):
-        self._filter_table(self.series_table, self.series_streams, self.series_group_combo)
+        self._filter_and_update(self.series_table, self.series_streams, self.series_group_list, self.series_cat_map)
 
-    def _filter_table(self, table, all_data, combo):
-        cat_id = combo.currentData()
+    def _filter_and_update(self, table, all_data, list_widget, cat_map):
+        current_item = list_widget.currentItem()
+        if not current_item: return
+        cat_id = current_item.data(Qt.UserRole)
+
         if cat_id is None:
-            self.populate_table(table, all_data)
+            self.populate_table(table, all_data, cat_map)
         else:
             filtered = [x for x in all_data if str(x.get('category_id', '')) == str(cat_id)]
-            self.populate_table(table, filtered)
+            self.populate_table(table, filtered, cat_map)
 
     def play_playlist_ffplay(self):
         m3u_url = f"{self.server_url}/get.php?username={self.username}&password={self.password}&type=m3u_plus&output=ts"
@@ -1368,40 +1572,47 @@ class PlaylistViewerDialog(QDialog):
         except FileNotFoundError:
             QMessageBox.critical(self, "Error", "ffplay not found. Please ensure FFmpeg is installed and in your system PATH.")
 
-    def play_stream_ffplay(self, index):
-        table = self.sender()
-        if not table: return
-
-        row = index.row()
-        stream_id = table.item(row, 2).text()
-
-        # Determine type
+    def get_stream_url(self, table, row):
+        stream_id = table.item(row, 3).text()
         stream_type = "live"
         extension = "ts"
         if table == self.vod_table:
             stream_type = "movie"
-            extension = "mp4" # Default guess, XC usually redirects
+            extension = "mp4"
         elif table == self.series_table:
+            # Series playback direct is tricky, usually series ID -> episodes.
+            # For this MVP, we try standard endpoint but might fail for containers.
             stream_type = "series"
-            extension = "mp4" # Series are trickier, usually need to get episode info first.
-            # For direct play, this URL might not work for series parents, but works for some structures.
-            # Usually Series -> Episodes. This simple viewer lists Series. Playing a Series ID directly usually fails.
-            # But let's try standard structure.
-
-        # Construct URL
-        # Live: http://domain:port/live/user/pass/ID.ts
-        # Movie: http://domain:port/movie/user/pass/ID.mp4
+            extension = "mp4"
 
         if stream_type == "series":
-             QMessageBox.information(self, "Info", "Direct playback of Series container not supported in this simple viewer. Please use VOD/Live.")
-             return
+             return None # Block series for now or handle differently
 
-        stream_url = f"{self.server_url}/{stream_type}/{self.username}/{self.password}/{stream_id}.{extension}"
+        return f"{self.server_url}/{stream_type}/{self.username}/{self.password}/{stream_id}.{extension}"
 
-        try:
-            subprocess.Popen(['ffplay', '-autoexit', stream_url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except FileNotFoundError:
-            QMessageBox.critical(self, "Error", "ffplay not found. Please ensure FFmpeg is installed and in your system PATH.")
+    def play_stream_from_table_doubleclick(self, index):
+        table = self.sender()
+        self.play_stream_common(table, index.row())
+
+    def play_stream_from_button(self, row, table):
+        self.play_stream_common(table, row)
+
+    def play_stream_common(self, table, row):
+        stream_url = self.get_stream_url(table, row)
+        if not stream_url:
+            QMessageBox.information(self, "Info", "Direct playback for this type not supported.")
+            return
+
+        if HAS_MULTIMEDIA:
+            # Embedded Player Logic
+            self.media_player.setSource(QUrl(stream_url))
+            self.media_player.play()
+        else:
+            # Fallback to ffplay
+            try:
+                subprocess.Popen(['ffplay', '-autoexit', stream_url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except FileNotFoundError:
+                QMessageBox.critical(self, "Error", "ffplay not found. Please ensure FFmpeg is installed.")
 
 
 # =============================================================================
