@@ -16,6 +16,7 @@ import time
 import csv
 import re # Added for MAC address validation
 import socket # Added for DNS lookup
+import subprocess # Added for ffplay
 from typing import Optional # Added for type hinting
 # import html # Not currently used
 from urllib.parse import urlparse, parse_qs
@@ -437,6 +438,39 @@ def get_series_all(server_base_url, username, password, session=None):
         return response.json()
     except Exception as e:
         logging.error(f"Error fetching series: {e}")
+        return []
+
+def get_live_categories(server_base_url, username, password, session=None):
+    if not session: session = requests.Session()
+    api_url = f"{server_base_url.rstrip('/')}/player_api.php?username={username}&password={password}&action=get_live_categories"
+    try:
+        response = session.get(api_url, timeout=10, headers=API_HEADERS)
+        response.raise_for_status()
+        return response.json()
+    except Exception as e:
+        logging.error(f"Error fetching live categories: {e}")
+        return []
+
+def get_vod_categories(server_base_url, username, password, session=None):
+    if not session: session = requests.Session()
+    api_url = f"{server_base_url.rstrip('/')}/player_api.php?username={username}&password={password}&action=get_vod_categories"
+    try:
+        response = session.get(api_url, timeout=10, headers=API_HEADERS)
+        response.raise_for_status()
+        return response.json()
+    except Exception as e:
+        logging.error(f"Error fetching VOD categories: {e}")
+        return []
+
+def get_series_categories(server_base_url, username, password, session=None):
+    if not session: session = requests.Session()
+    api_url = f"{server_base_url.rstrip('/')}/player_api.php?username={username}&password={password}&action=get_series_categories"
+    try:
+        response = session.get(api_url, timeout=10, headers=API_HEADERS)
+        response.raise_for_status()
+        return response.json()
+    except Exception as e:
+        logging.error(f"Error fetching series categories: {e}")
         return []
 
 def check_account_status_detailed_api(server_base_url, username, password, session):
@@ -1158,6 +1192,11 @@ class PlaylistViewerDialog(QDialog):
         self.username = username
         self.password = password
 
+        # Data storage
+        self.live_streams = []
+        self.vod_streams = []
+        self.series_streams = []
+
         layout = QVBoxLayout(self)
 
         self.tabs = QTabWidget()
@@ -1177,10 +1216,10 @@ class PlaylistViewerDialog(QDialog):
 
         # Open Source Button
         btn_layout = QHBoxLayout()
-        self.open_source_btn = QPushButton("Open M3U in Browser")
-        self.open_source_btn.clicked.connect(self.open_source)
+        self.play_playlist_btn = QPushButton("Play Playlist with ffplay")
+        self.play_playlist_btn.clicked.connect(self.play_playlist_ffplay)
         btn_layout.addStretch()
-        btn_layout.addWidget(self.open_source_btn)
+        btn_layout.addWidget(self.play_playlist_btn)
         layout.addLayout(btn_layout)
 
         # Load data (could be threaded, simple direct call for MVP)
@@ -1188,45 +1227,138 @@ class PlaylistViewerDialog(QDialog):
 
     def setup_tab(self, tab_widget, title):
         layout = QVBoxLayout(tab_widget)
+
+        # Group Filter
+        group_layout = QHBoxLayout()
+        group_layout.addWidget(QLabel("Group:"))
+        combo = QComboBox()
+        combo.setMinimumWidth(200)
+        group_layout.addWidget(combo)
+        group_layout.addStretch()
+        layout.addLayout(group_layout)
+
         table = QTableWidget()
-        table.setColumnCount(3)
-        table.setHorizontalHeaderLabels(["ID", "Name", "Stream ID"])
+        table.setColumnCount(4) # ID, Name, Stream ID, Hidden Cat ID
+        table.setHorizontalHeaderLabels(["ID", "Name", "Stream ID", "Cat ID"])
         table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        table.setColumnHidden(3, True) # Hide Category ID column
+        table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        table.doubleClicked.connect(self.play_stream_ffplay)
         layout.addWidget(table)
 
-        # Store reference to table
-        if title == "Live TV": self.live_table = table
-        elif title == "VOD": self.vod_table = table
-        elif title == "Series": self.series_table = table
+        # Store references
+        if title == "Live TV":
+            self.live_table = table
+            self.live_group_combo = combo
+            self.live_group_combo.currentIndexChanged.connect(self.filter_live_streams)
+        elif title == "VOD":
+            self.vod_table = table
+            self.vod_group_combo = combo
+            self.vod_group_combo.currentIndexChanged.connect(self.filter_vod_streams)
+        elif title == "Series":
+            self.series_table = table
+            self.series_group_combo = combo
+            self.series_group_combo.currentIndexChanged.connect(self.filter_series_streams)
 
     def load_data(self):
-        # Live
-        live_data = get_live_streams_all(self.server_url, self.username, self.password)
-        self.populate_table(self.live_table, live_data)
+        # Fetch Categories First
+        live_cats = get_live_categories(self.server_url, self.username, self.password)
+        vod_cats = get_vod_categories(self.server_url, self.username, self.password)
+        series_cats = get_series_categories(self.server_url, self.username, self.password)
 
-        # VOD
-        vod_data = get_vod_streams_all(self.server_url, self.username, self.password)
-        self.populate_table(self.vod_table, vod_data)
+        self.populate_combo(self.live_group_combo, live_cats)
+        self.populate_combo(self.vod_group_combo, vod_cats)
+        self.populate_combo(self.series_group_combo, series_cats)
 
-        # Series
-        series_data = get_series_all(self.server_url, self.username, self.password)
-        self.populate_table(self.series_table, series_data)
+        # Fetch Streams
+        self.live_streams = get_live_streams_all(self.server_url, self.username, self.password)
+        self.vod_streams = get_vod_streams_all(self.server_url, self.username, self.password)
+        self.series_streams = get_series_all(self.server_url, self.username, self.password)
+
+        # Initial Populate (All)
+        self.filter_live_streams()
+        self.filter_vod_streams()
+        self.filter_series_streams()
+
+    def populate_combo(self, combo, categories):
+        combo.clear()
+        combo.addItem("All Categories", None)
+        for cat in categories:
+            combo.addItem(cat.get('category_name', 'Unknown'), cat.get('category_id'))
 
     def populate_table(self, table, data_list):
+        table.setRowCount(0)
         if not data_list: return
         table.setRowCount(len(data_list))
         for row, item in enumerate(data_list):
-            # item is a dict
             stream_id = str(item.get('stream_id', item.get('series_id', '')))
             name = item.get('name', item.get('num', ''))
+            cat_id = str(item.get('category_id', ''))
 
             table.setItem(row, 0, QTableWidgetItem(str(row + 1)))
             table.setItem(row, 1, QTableWidgetItem(name))
             table.setItem(row, 2, QTableWidgetItem(stream_id))
+            table.setItem(row, 3, QTableWidgetItem(cat_id))
 
-    def open_source(self):
+    def filter_live_streams(self):
+        self._filter_table(self.live_table, self.live_streams, self.live_group_combo)
+
+    def filter_vod_streams(self):
+        self._filter_table(self.vod_table, self.vod_streams, self.vod_group_combo)
+
+    def filter_series_streams(self):
+        self._filter_table(self.series_table, self.series_streams, self.series_group_combo)
+
+    def _filter_table(self, table, all_data, combo):
+        cat_id = combo.currentData()
+        if cat_id is None:
+            self.populate_table(table, all_data)
+        else:
+            filtered = [x for x in all_data if str(x.get('category_id', '')) == str(cat_id)]
+            self.populate_table(table, filtered)
+
+    def play_playlist_ffplay(self):
         m3u_url = f"{self.server_url}/get.php?username={self.username}&password={self.password}&type=m3u_plus&output=ts"
-        QDesktopServices.openUrl(m3u_url)
+        try:
+            subprocess.Popen(['ffplay', m3u_url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except FileNotFoundError:
+            QMessageBox.critical(self, "Error", "ffplay not found. Please ensure FFmpeg is installed and in your system PATH.")
+
+    def play_stream_ffplay(self, index):
+        table = self.sender()
+        if not table: return
+
+        row = index.row()
+        stream_id = table.item(row, 2).text()
+
+        # Determine type
+        stream_type = "live"
+        extension = "ts"
+        if table == self.vod_table:
+            stream_type = "movie"
+            extension = "mp4" # Default guess, XC usually redirects
+        elif table == self.series_table:
+            stream_type = "series"
+            extension = "mp4" # Series are trickier, usually need to get episode info first.
+            # For direct play, this URL might not work for series parents, but works for some structures.
+            # Usually Series -> Episodes. This simple viewer lists Series. Playing a Series ID directly usually fails.
+            # But let's try standard structure.
+
+        # Construct URL
+        # Live: http://domain:port/live/user/pass/ID.ts
+        # Movie: http://domain:port/movie/user/pass/ID.mp4
+
+        if stream_type == "series":
+             QMessageBox.information(self, "Info", "Direct playback of Series container not supported in this simple viewer. Please use VOD/Live.")
+             return
+
+        stream_url = f"{self.server_url}/{stream_type}/{self.username}/{self.password}/{stream_id}.{extension}"
+
+        try:
+            subprocess.Popen(['ffplay', '-autoexit', stream_url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except FileNotFoundError:
+            QMessageBox.critical(self, "Error", "ffplay not found. Please ensure FFmpeg is installed and in your system PATH.")
 
 
 # =============================================================================
