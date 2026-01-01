@@ -1789,7 +1789,7 @@ class MainWindow(QMainWindow):
             try:
                 dt_utc = QDateTime.fromString(last_chk_raw.split('.')[0], Qt.ISODate).toUTC()
                 if not dt_utc.isValid() : dt_utc = QDateTime.fromString(last_chk_raw, Qt.ISODateWithMs).toUTC()
-                dt_local = dt_utc.toLocalTime(); last_chk_disp = dt_local.toString("yyyy-MM-dd hh:mm")
+                dt_local = dt_utc.toLocalTime(); last_chk_disp = dt_local.toString("yy-MM-dd hh:mm")
             except Exception as e: logging.warning(f"Error parsing last_checked_at '{last_chk_raw}': {e}")
         items.append(QStandardItem(last_chk_disp))
 
