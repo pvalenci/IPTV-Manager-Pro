@@ -1426,12 +1426,12 @@ class PlaylistViewerDialog(QDialog):
         # Set initial sizes explicitly to avoid cramped look if stretch doesn't kick in immediately
         splitter.setSizes([250, 450, 500])
 
-        main_layout.addWidget(splitter)
+        main_layout.addWidget(splitter, 1) # Add with stretch factor 1 to take available space
 
         # Status Label (Highlighted functionality)
         status_label = QLabel("Loaded 0 items.")
         status_label.setStyleSheet("color: gray; padding: 5px;")
-        main_layout.addWidget(status_label)
+        main_layout.addWidget(status_label, 0) # Add with stretch factor 0 to take minimum space
 
         # Store references (updated for ListWidget)
         if title == "Live TV":
