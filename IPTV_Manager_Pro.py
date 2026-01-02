@@ -17,6 +17,7 @@ import csv
 import re # Added for MAC address validation
 import socket # Added for DNS lookup
 import subprocess # Added for ffplay
+import base64 # Added for EPG decoding
 from typing import Optional # Added for type hinting
 # import html # Not currently used
 from urllib.parse import urlparse, parse_qs
@@ -52,15 +53,14 @@ try:
     )
 
     # Attempt to import QtMultimedia (optional, for embedded player)
-    # Disabled for now in favor of EPG
     HAS_MULTIMEDIA = False
-    # try:
-    #     from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
-    #     from PySide6.QtMultimediaWidgets import QVideoWidget
-    #     HAS_MULTIMEDIA = True
-    # except ImportError:
-    #     HAS_MULTIMEDIA = False
-    #     print("Warning: QtMultimedia not found. Embedded player will be disabled.")
+    try:
+        from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
+        from PySide6.QtMultimediaWidgets import QVideoWidget
+        HAS_MULTIMEDIA = True
+    except ImportError:
+        HAS_MULTIMEDIA = False
+        print("Warning: QtMultimedia not found. Embedded player will be disabled.")
 
 except ImportError:
     print("\nError: Required library 'PySide6' not found. Please install it: pip install PySide6", file=sys.stderr)
@@ -1318,7 +1318,7 @@ class PlaylistViewerDialog(QDialog):
                 color: #333;
             }
             QListWidget::item {
-                padding: 2px;
+                padding: 5px; /* Increased padding */
                 border-bottom: 1px solid #eee;
             }
             QListWidget::item:selected {
@@ -1368,11 +1368,11 @@ class PlaylistViewerDialog(QDialog):
         table.itemClicked.connect(self.on_table_item_clicked)
         splitter.addWidget(table)
 
-        # --- Right Panel: EPG List ---
-        epg_container = QWidget()
-        epg_layout = QVBoxLayout(epg_container)
-        epg_layout.setContentsMargins(0, 0, 0, 0)
+        # --- Right Panel: EPG List + Video Box ---
+        # Use a Vertical Splitter for EPG (top) and Video (bottom)
+        right_splitter = QSplitter(Qt.Vertical)
 
+        # 1. EPG List
         epg_list = QListWidget()
         epg_list.setStyleSheet("""
             QListWidget {
@@ -1386,19 +1386,40 @@ class PlaylistViewerDialog(QDialog):
                 border-bottom: 1px solid #eee;
             }
         """)
-        epg_layout.addWidget(epg_list)
+        right_splitter.addWidget(epg_list)
+
+        # 2. Video Box
+        video_widget = None
+        if HAS_MULTIMEDIA:
+            video_widget = QVideoWidget()
+            video_widget.setStyleSheet("background-color: black;")
+        else:
+            # Placeholder if no multimedia
+            video_widget = QLabel("Video Player\n(QtMultimedia not available)")
+            video_widget.setAlignment(Qt.AlignCenter)
+            video_widget.setStyleSheet("background-color: black; color: white;")
+
+        right_splitter.addWidget(video_widget)
+        right_splitter.setStretchFactor(0, 2) # EPG takes more space initially? Or 1:1
+        right_splitter.setStretchFactor(1, 1)
+
+        splitter.addWidget(right_splitter)
 
         # Store references
-        if title == "Live TV": self.live_epg_list = epg_list
-        elif title == "VOD": self.vod_epg_list = epg_list
-        elif title == "Series": self.series_epg_list = epg_list
-
-        splitter.addWidget(epg_container)
+        if title == "Live TV":
+            self.live_epg_list = epg_list
+            self.live_video_widget = video_widget
+        elif title == "VOD":
+            self.vod_epg_list = epg_list
+            self.vod_video_widget = video_widget
+        elif title == "Series":
+            self.series_epg_list = epg_list
+            self.series_video_widget = video_widget
 
         # Set initial stretch factors (index, stretch)
         splitter.setStretchFactor(0, 1) # List
         splitter.setStretchFactor(1, 2) # Table
-        splitter.setStretchFactor(2, 3) # Video
+        splitter.setStretchFactor(2, 2) # Video/EPG Column
 
         # Set initial sizes explicitly to avoid cramped look if stretch doesn't kick in immediately
         splitter.setSizes([250, 450, 500])
@@ -1445,26 +1466,26 @@ class PlaylistViewerDialog(QDialog):
         if self.vod_group_list.count() > 0: self.vod_group_list.setCurrentRow(0)
         if self.series_group_list.count() > 0: self.series_group_list.setCurrentRow(0)
 
-        # Init Player if available (Currently disabled in favor of EPG)
-        # if HAS_MULTIMEDIA:
-        #     self.media_player = QMediaPlayer()
-        #     self.audio_output = QAudioOutput()
-        #     self.media_player.setAudioOutput(self.audio_output)
-        #     # We need to switch video output when tabs change
-        #     self.tabs.currentChanged.connect(self.on_tab_changed)
-        #     # Set initial output
-        #     self.on_tab_changed(self.tabs.currentIndex())
+        # Init Player if available
+        if HAS_MULTIMEDIA:
+            self.media_player = QMediaPlayer()
+            self.audio_output = QAudioOutput()
+            self.media_player.setAudioOutput(self.audio_output)
+            # We need to switch video output when tabs change
+            self.tabs.currentChanged.connect(self.on_tab_changed)
+            # Set initial output
+            self.on_tab_changed(self.tabs.currentIndex())
 
-    # def on_tab_changed(self, index):
-    #     if not HAS_MULTIMEDIA: return
-    #     self.media_player.stop() # Stop playback on tab switch
-    #     # Set video output to the widget in the current tab
-    #     if index == 0: # Live
-    #         self.media_player.setVideoOutput(self.live_video_widget)
-    #     elif index == 1: # VOD
-    #         self.media_player.setVideoOutput(self.vod_video_widget)
-    #     elif index == 2: # Series
-    #         self.media_player.setVideoOutput(self.series_video_widget)
+    def on_tab_changed(self, index):
+        if not HAS_MULTIMEDIA: return
+        self.media_player.stop() # Stop playback on tab switch
+        # Set video output to the widget in the current tab
+        if index == 0: # Live
+            self.media_player.setVideoOutput(self.live_video_widget)
+        elif index == 1: # VOD
+            self.media_player.setVideoOutput(self.vod_video_widget)
+        elif index == 2: # Series
+            self.media_player.setVideoOutput(self.series_video_widget)
 
     def populate_list(self, list_widget, categories):
         list_widget.clear()
@@ -1574,11 +1595,15 @@ class PlaylistViewerDialog(QDialog):
             QMessageBox.information(self, "Info", "Direct playback for this type not supported.")
             return
 
-        # Always use external player (ffplay) as we replaced the embedded player with EPG
-        try:
-            subprocess.Popen(['ffplay', '-autoexit', stream_url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except FileNotFoundError:
-            QMessageBox.critical(self, "Error", "ffplay not found. Please ensure FFmpeg is installed.")
+        if HAS_MULTIMEDIA:
+            self.media_player.setSource(QUrl(stream_url))
+            self.media_player.play()
+        else:
+            # Fallback to external player (ffplay)
+            try:
+                subprocess.Popen(['ffplay', '-autoexit', stream_url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except FileNotFoundError:
+                QMessageBox.critical(self, "Error", "ffplay not found. Please ensure FFmpeg is installed.")
 
     def load_epg_for_stream(self, stream_id):
         # Determine which list widget to use based on current tab
@@ -1610,8 +1635,10 @@ class PlaylistViewerDialog(QDialog):
 
             for prog in epg_data:
                 # Structure: start, end, title, description, start_timestamp, stop_timestamp
-                title = prog.get('title')
-                desc = prog.get('description', '')
+                # Attempt to decode title/desc if they are base64 (common in XC)
+                title = decode_xc_text(prog.get('title'))
+                desc = decode_xc_text(prog.get('description', ''))
+
                 start_ts = int(prog.get('start_timestamp', 0))
                 stop_ts = int(prog.get('stop_timestamp', 0))
 
@@ -3156,3 +3183,17 @@ def excepthook(exc_type, exc_value, exc_traceback):
     input("Press Enter to exit...")
 
 sys.excepthook = excepthook
+def decode_xc_text(text):
+    """
+    Attempts to decode text that might be Base64 encoded (common in Xtream Codes API).
+    Falls back to the original text if decoding fails.
+    """
+    if not text:
+        return ""
+    try:
+        # Check if it looks like base64
+        # (This is a heuristic; XC usually encodes everything or nothing)
+        decoded_bytes = base64.b64decode(text, validate=True)
+        return decoded_bytes.decode('utf-8')
+    except Exception:
+        return text
