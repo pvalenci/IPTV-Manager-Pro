@@ -1243,6 +1243,7 @@ class PlaylistViewerDialog(QDialog):
         self.setWindowTitle(f"Playlist Viewer - {server_url}")
         self.resize(1200, 800)
         self.setWindowState(Qt.WindowMaximized)
+        self.setWindowFlags(self.windowFlags() | Qt.WindowMinimizeButtonHint | Qt.WindowMaximizeButtonHint | Qt.WindowCloseButtonHint)
         self.server_url = server_url
         self.username = username
         self.password = password
@@ -1335,11 +1336,11 @@ class PlaylistViewerDialog(QDialog):
             QListWidget {
                 background-color: #f9f9f9;
                 border: 1px solid #ddd;
-                font-size: 13px;
+                font-size: 12px;
                 color: #333;
             }
             QListWidget::item {
-                padding: 5px;
+                padding: 2px;
                 border-bottom: 1px solid #eee;
             }
             QListWidget::item:selected {
@@ -1367,11 +1368,15 @@ class PlaylistViewerDialog(QDialog):
         table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         table.setAlternatingRowColors(True)
         table.verticalHeader().setVisible(False)
+        table.verticalHeader().setDefaultSectionSize(24)
         table.setStyleSheet("""
             QTableWidget {
                 background-color: white;
                 gridline-color: #eee;
                 border: 1px solid #ddd;
+            }
+            QTableWidget::item {
+                padding: 2px;
             }
             QHeaderView::section {
                 background-color: #f2f2f2;
