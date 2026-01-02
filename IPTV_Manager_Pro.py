@@ -17,6 +17,7 @@ import csv
 import re # Added for MAC address validation
 import socket # Added for DNS lookup
 import subprocess # Added for ffplay
+import base64 # Added for EPG decoding
 from typing import Optional # Added for type hinting
 # import html # Not currently used
 from urllib.parse import urlparse, parse_qs
@@ -1669,8 +1670,9 @@ class PlaylistViewerDialog(QDialog):
 
             for prog in epg_data:
                 # Structure: start, end, title, description, start_timestamp, stop_timestamp
-                title = prog.get('title')
-                desc = prog.get('description', '')
+                # Decode title/desc if they are base64 (common in XC)
+                title = decode_base64_text(prog.get('title'))
+                desc = decode_base64_text(prog.get('description', ''))
 
                 # get_simple_data_table might use different keys or format?
                 # Usually it has 'title', 'description', 'start_timestamp', 'stop_timestamp' just like short epg.
@@ -3224,3 +3226,17 @@ def excepthook(exc_type, exc_value, exc_traceback):
     input("Press Enter to exit...")
 
 sys.excepthook = excepthook
+def decode_base64_text(text):
+    """
+    Attempts to decode Base64 text. Returns original text if decoding fails.
+    Used for Xtream Codes EPG data which is often Base64 encoded.
+    """
+    if not text:
+        return ""
+    try:
+        # Check if it looks like base64
+        # (This is a heuristic; XC usually encodes everything or nothing)
+        decoded_bytes = base64.b64decode(text, validate=True)
+        return decoded_bytes.decode('utf-8', 'ignore')
+    except Exception:
+        return text
