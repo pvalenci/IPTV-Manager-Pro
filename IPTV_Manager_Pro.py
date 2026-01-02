@@ -52,13 +52,15 @@ try:
     )
 
     # Attempt to import QtMultimedia (optional, for embedded player)
-    try:
-        from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
-        from PySide6.QtMultimediaWidgets import QVideoWidget
-        HAS_MULTIMEDIA = True
-    except ImportError:
-        HAS_MULTIMEDIA = False
-        print("Warning: QtMultimedia not found. Embedded player will be disabled.")
+    # Disabled for now in favor of EPG
+    HAS_MULTIMEDIA = False
+    # try:
+    #     from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
+    #     from PySide6.QtMultimediaWidgets import QVideoWidget
+    #     HAS_MULTIMEDIA = True
+    # except ImportError:
+    #     HAS_MULTIMEDIA = False
+    #     print("Warning: QtMultimedia not found. Embedded player will be disabled.")
 
 except ImportError:
     print("\nError: Required library 'PySide6' not found. Please install it: pip install PySide6", file=sys.stderr)
@@ -496,6 +498,23 @@ def get_series_categories(server_base_url, username, password, session=None):
         return response.json()
     except Exception as e:
         logging.error(f"Error fetching series categories: {e}")
+        return []
+
+def get_short_epg(server_base_url, username, password, stream_id, limit=50, session=None):
+    if not session: session = requests.Session()
+    api_url = f"{server_base_url.rstrip('/')}/player_api.php?username={username}&password={password}&action=get_short_epg&stream_id={stream_id}&limit={limit}"
+    try:
+        response = session.get(api_url, timeout=10, headers=API_HEADERS)
+        response.raise_for_status()
+        data = response.json()
+        # Handle different EPG response formats
+        if isinstance(data, dict) and "epg_listings" in data:
+            return data["epg_listings"]
+        elif isinstance(data, list):
+            return data
+        return []
+    except Exception as e:
+        logging.error(f"Error fetching short EPG for stream {stream_id}: {e}")
         return []
 
 def check_account_status_detailed_api(server_base_url, username, password, session):
@@ -1282,47 +1301,6 @@ class PlaylistViewerDialog(QDialog):
         QTimer.singleShot(100, self.load_data)
 
     def setup_tab(self, tab_widget, title):
-        layout = QVBoxLayout(tab_widget)
-
-        # Group Filter
-        group_layout = QHBoxLayout()
-        group_layout.addWidget(QLabel("Group:"))
-        combo = QComboBox()
-        combo.setMinimumWidth(200)
-        group_layout.addWidget(combo)
-        group_layout.addStretch()
-        layout.addLayout(group_layout)
-
-        table = QTableWidget()
-        table.setColumnCount(4) # ID, Name, Stream ID, Hidden Cat ID
-        table.setHorizontalHeaderLabels(["ID", "Name", "Stream ID", "Cat ID"])
-        table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
-        table.setColumnHidden(3, True) # Hide Category ID column
-        table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        table.doubleClicked.connect(self.play_stream_ffplay)
-        layout.addWidget(table)
-
-        # Store references
-        if title == "Live TV":
-            self.live_table = table
-            self.live_group_list = list_widget
-            self.live_group_list.currentItemChanged.connect(self.filter_live_streams)
-        elif title == "VOD":
-            self.vod_table = table
-            self.vod_group_list = list_widget
-            self.vod_group_list.currentItemChanged.connect(self.filter_vod_streams)
-        elif title == "Series":
-            self.series_table = table
-            self.series_group_list = list_widget
-            self.series_group_list.currentItemChanged.connect(self.filter_series_streams)
-
-        # Connect Video Widget if multimedia is available
-        if HAS_MULTIMEDIA and self.media_player:
-             # Just ensures the video widget is ready, no specific connect needed here yet
-             pass
-
-    def setup_tab(self, tab_widget, title):
         # Use QSplitter for resizable panels
         main_layout = QVBoxLayout(tab_widget)
         main_layout.setContentsMargins(10, 10, 10, 10)
@@ -1363,6 +1341,7 @@ class PlaylistViewerDialog(QDialog):
         header.setSectionResizeMode(1, QHeaderView.Stretch) # Name gets most space
         header.setSectionResizeMode(2, QHeaderView.ResizeToContents) # Actions (Button)
 
+        table.setColumnHidden(0, True) # Hide Group column (redundant with left panel)
         table.setColumnHidden(3, True) # Hide StreamID
         table.setSelectionBehavior(QAbstractItemView.SelectRows)
         table.setEditTriggers(QAbstractItemView.NoEditTriggers)
@@ -1386,30 +1365,35 @@ class PlaylistViewerDialog(QDialog):
             }
         """)
         table.doubleClicked.connect(self.play_stream_from_table_doubleclick)
+        table.itemClicked.connect(self.on_table_item_clicked)
         splitter.addWidget(table)
 
-        # --- Right Panel: Video Player ---
-        # Container for video to manage size behavior in splitter
-        video_container = QWidget()
-        video_layout = QVBoxLayout(video_container)
-        video_layout.setContentsMargins(0, 0, 0, 0)
+        # --- Right Panel: EPG List ---
+        epg_container = QWidget()
+        epg_layout = QVBoxLayout(epg_container)
+        epg_layout.setContentsMargins(0, 0, 0, 0)
 
-        if HAS_MULTIMEDIA:
-            video_widget = QVideoWidget()
-            video_widget.setStyleSheet("background-color: black;")
-            video_layout.addWidget(video_widget)
+        epg_list = QListWidget()
+        epg_list.setStyleSheet("""
+            QListWidget {
+                background-color: #f9f9f9;
+                border: 1px solid #ddd;
+                font-size: 12px;
+                color: #333;
+            }
+            QListWidget::item {
+                padding: 5px;
+                border-bottom: 1px solid #eee;
+            }
+        """)
+        epg_layout.addWidget(epg_list)
 
-            # Store this tab's video widget
-            if title == "Live TV": self.live_video_widget = video_widget
-            elif title == "VOD": self.vod_video_widget = video_widget
-            elif title == "Series": self.series_video_widget = video_widget
-        else:
-            label = QLabel("Video Player\n(Not Available)")
-            label.setAlignment(Qt.AlignCenter)
-            label.setStyleSheet("background-color: #eee; color: #888; border: 1px solid #ccc;")
-            video_layout.addWidget(label)
+        # Store references
+        if title == "Live TV": self.live_epg_list = epg_list
+        elif title == "VOD": self.vod_epg_list = epg_list
+        elif title == "Series": self.series_epg_list = epg_list
 
-        splitter.addWidget(video_container)
+        splitter.addWidget(epg_container)
 
         # Set initial stretch factors (index, stretch)
         splitter.setStretchFactor(0, 1) # List
@@ -1461,26 +1445,26 @@ class PlaylistViewerDialog(QDialog):
         if self.vod_group_list.count() > 0: self.vod_group_list.setCurrentRow(0)
         if self.series_group_list.count() > 0: self.series_group_list.setCurrentRow(0)
 
-        # Init Player if available
-        if HAS_MULTIMEDIA:
-            self.media_player = QMediaPlayer()
-            self.audio_output = QAudioOutput()
-            self.media_player.setAudioOutput(self.audio_output)
-            # We need to switch video output when tabs change
-            self.tabs.currentChanged.connect(self.on_tab_changed)
-            # Set initial output
-            self.on_tab_changed(self.tabs.currentIndex())
+        # Init Player if available (Currently disabled in favor of EPG)
+        # if HAS_MULTIMEDIA:
+        #     self.media_player = QMediaPlayer()
+        #     self.audio_output = QAudioOutput()
+        #     self.media_player.setAudioOutput(self.audio_output)
+        #     # We need to switch video output when tabs change
+        #     self.tabs.currentChanged.connect(self.on_tab_changed)
+        #     # Set initial output
+        #     self.on_tab_changed(self.tabs.currentIndex())
 
-    def on_tab_changed(self, index):
-        if not HAS_MULTIMEDIA: return
-        self.media_player.stop() # Stop playback on tab switch
-        # Set video output to the widget in the current tab
-        if index == 0: # Live
-            self.media_player.setVideoOutput(self.live_video_widget)
-        elif index == 1: # VOD
-            self.media_player.setVideoOutput(self.vod_video_widget)
-        elif index == 2: # Series
-            self.media_player.setVideoOutput(self.series_video_widget)
+    # def on_tab_changed(self, index):
+    #     if not HAS_MULTIMEDIA: return
+    #     self.media_player.stop() # Stop playback on tab switch
+    #     # Set video output to the widget in the current tab
+    #     if index == 0: # Live
+    #         self.media_player.setVideoOutput(self.live_video_widget)
+    #     elif index == 1: # VOD
+    #         self.media_player.setVideoOutput(self.vod_video_widget)
+    #     elif index == 2: # Series
+    #         self.media_player.setVideoOutput(self.series_video_widget)
 
     def populate_list(self, list_widget, categories):
         list_widget.clear()
@@ -1573,6 +1557,14 @@ class PlaylistViewerDialog(QDialog):
         table = self.sender()
         self.play_stream_common(table, index.row())
 
+    def on_table_item_clicked(self, item):
+        row = item.row()
+        table = self.sender() # QTableWidget
+        stream_id_item = table.item(row, 3) # Hidden Stream ID column
+        if stream_id_item:
+            stream_id = stream_id_item.text()
+            self.load_epg_for_stream(stream_id)
+
     def play_stream_from_button(self, row, table):
         self.play_stream_common(table, row)
 
@@ -1582,16 +1574,85 @@ class PlaylistViewerDialog(QDialog):
             QMessageBox.information(self, "Info", "Direct playback for this type not supported.")
             return
 
-        if HAS_MULTIMEDIA:
-            # Embedded Player Logic
-            self.media_player.setSource(QUrl(stream_url))
-            self.media_player.play()
-        else:
-            # Fallback to ffplay
-            try:
-                subprocess.Popen(['ffplay', '-autoexit', stream_url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            except FileNotFoundError:
-                QMessageBox.critical(self, "Error", "ffplay not found. Please ensure FFmpeg is installed.")
+        # Always use external player (ffplay) as we replaced the embedded player with EPG
+        try:
+            subprocess.Popen(['ffplay', '-autoexit', stream_url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except FileNotFoundError:
+            QMessageBox.critical(self, "Error", "ffplay not found. Please ensure FFmpeg is installed.")
+
+    def load_epg_for_stream(self, stream_id):
+        # Determine which list widget to use based on current tab
+        current_tab_idx = self.tabs.currentIndex()
+        epg_list = None
+        if current_tab_idx == 0: epg_list = self.live_epg_list
+        elif current_tab_idx == 1: epg_list = self.vod_epg_list
+        elif current_tab_idx == 2: epg_list = self.series_epg_list
+
+        if not epg_list: return
+
+        epg_list.clear()
+        epg_list.addItem("Loading EPG...")
+        QApplication.processEvents()
+
+        try:
+            epg_data = get_short_epg(self.server_url, self.username, self.password, stream_id)
+            epg_list.clear()
+
+            if not epg_data:
+                epg_list.addItem("No EPG Data Found")
+                return
+
+            current_ts = time.time() # UTC timestamp roughly
+            # Adjust if needed. XC usually returns server time text but UTC timestamps.
+            # We will use timestamps for logic.
+
+            found_current = False
+
+            for prog in epg_data:
+                # Structure: start, end, title, description, start_timestamp, stop_timestamp
+                title = prog.get('title')
+                desc = prog.get('description', '')
+                start_ts = int(prog.get('start_timestamp', 0))
+                stop_ts = int(prog.get('stop_timestamp', 0))
+
+                # Format time
+                # Convert UTC timestamp to local display time
+                try:
+                    dt_start = datetime.fromtimestamp(start_ts, tz=timezone.utc).astimezone(DISPLAY_TZ)
+                    dt_stop = datetime.fromtimestamp(stop_ts, tz=timezone.utc).astimezone(DISPLAY_TZ)
+                    time_str = f"{dt_start.strftime('%I:%M %p')} - {dt_stop.strftime('%I:%M %p')}"
+                except Exception:
+                    time_str = f"{prog.get('start')} - {prog.get('end')}"
+
+                # Create Item
+                item_text = f"{time_str}\n{title}"
+                if desc:
+                    # Truncate desc if too long
+                    if len(desc) > 100: desc = desc[:100] + "..."
+                    item_text += f"\n{desc}"
+
+                item = QListWidgetItem(item_text)
+
+                # Highlight Current Program
+                # Logic: start_ts <= current_ts < stop_ts
+                # Note: XC timestamps are usually correct UTC.
+                if start_ts <= current_ts < stop_ts:
+                    # Green/Blue highlighting
+                    # Use a color that works for light/dark themes or hardcode a safe pastel
+                    item.setBackground(QColor("#e6f7ff")) # Light Blue
+                    item.setForeground(QColor("black")) # Ensure text is readable
+                    found_current = True
+
+                epg_list.addItem(item)
+
+                if found_current:
+                    epg_list.scrollToItem(item)
+                    found_current = False # Scrolled once
+
+        except Exception as e:
+            epg_list.clear()
+            epg_list.addItem(f"Error loading EPG: {e}")
+            logging.error(f"EPG Load Error: {e}")
 
 
 # =============================================================================
