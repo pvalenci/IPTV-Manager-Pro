@@ -1313,6 +1313,13 @@ class PlaylistViewerDialog(QDialog):
         btn_layout.addWidget(self.play_selected_external_btn)
         layout.addLayout(btn_layout)
 
+        # Preview Debounce Timer
+        self.preview_timer = QTimer()
+        self.preview_timer.setSingleShot(True)
+        self.preview_timer.setInterval(500) # 500ms delay
+        self.preview_timer.timeout.connect(self.start_preview_playback)
+        self.ffplay_process = None
+
         # Load data thread
         self.load_worker = PlaylistLoaderWorker(self.server_url, self.username, self.password)
         self.load_thread = QThread()
@@ -1330,6 +1337,24 @@ class PlaylistViewerDialog(QDialog):
         self.series_status_label.setText("Loading playlist data... Please wait.")
 
         self.load_thread.start()
+
+    def closeEvent(self, event):
+        self.cleanup_ffplay()
+        super().closeEvent(event)
+
+    def cleanup_ffplay(self):
+        if self.ffplay_process:
+            try:
+                self.ffplay_process.terminate()
+                self.ffplay_process.wait(timeout=1)
+            except Exception:
+                pass
+            if self.ffplay_process and self.ffplay_process.poll() is None:
+                try:
+                    self.ffplay_process.kill()
+                except Exception:
+                    pass
+            self.ffplay_process = None
 
     def setup_tab(self, tab_widget, title):
         # Use QSplitter for resizable panels
@@ -1398,7 +1423,8 @@ class PlaylistViewerDialog(QDialog):
             }
         """)
         table.doubleClicked.connect(self.play_stream_from_table_doubleclick)
-        table.itemClicked.connect(self.on_table_item_clicked)
+        # Connect selection change to playback for keyboard navigation support
+        table.itemSelectionChanged.connect(lambda: self.on_table_selection_changed(table))
         splitter.addWidget(table)
 
         # --- Right Panel: EPG List + Video Box ---
@@ -1670,34 +1696,129 @@ class PlaylistViewerDialog(QDialog):
         table = self.sender()
         self.play_stream_common(table, index.row())
 
-    def on_table_item_clicked(self, item):
-        row = item.row()
-        table = self.sender() # QTableWidget
+    def on_table_selection_changed(self, table):
+        """Handle selection changes (mouse click or keyboard nav) to update EPG and embedded player."""
+        selected_items = table.selectedItems()
+        if not selected_items: return
+
+        # In single row selection, we just grab the first item's row
+        row = selected_items[0].row()
+
+        # 1. Load EPG
         stream_id_item = table.item(row, 3) # Hidden Stream ID column
         if stream_id_item:
             stream_id = stream_id_item.text()
             self.load_epg_for_stream(stream_id)
 
-    def play_stream_from_button(self, row, table):
-        self.play_stream_common(table, row)
+        # 2. Start Preview Timer (Debounce)
+        # We restart the timer on every selection change. Playback starts when user stops scrolling.
+        self.preview_timer.start()
 
-    def play_stream_common(self, table, row):
+    def start_preview_playback(self):
+        # Determine current tab
+        current_tab_idx = self.tabs.currentIndex()
+        table = None
+        video_widget = None
+        if current_tab_idx == 0:
+            table = self.live_table
+            video_widget = self.live_video_widget
+        elif current_tab_idx == 1:
+            table = self.vod_table
+            video_widget = self.vod_video_widget
+        elif current_tab_idx == 2:
+            table = self.series_table
+            video_widget = self.series_video_widget
+
+        if not table or not video_widget: return
+
+        selected_items = table.selectedItems()
+        if not selected_items: return
+        row = selected_items[0].row()
+
+        self.play_stream_embedded(table, row, video_widget)
+
+    def play_stream_from_button(self, row, table):
+        # Double click action: Try embedded first, else standard logic
+        # Actually, double click often implies "Play fully", but here we treat as "Force Preview Update"
+        # or we could make it open external.
+        # Let's make double-click behave like the "Play External" button if embedded isn't available?
+        # Or just update preview.
+        self.start_preview_playback()
+
+    def play_stream_embedded(self, table, row, video_widget):
+        """Plays the stream in the small embedded video widget."""
         stream_url = self.get_stream_url(table, row)
-        if not stream_url:
-            QMessageBox.information(self, "Info", "Direct playback for this type not supported.")
-            return
+        if not stream_url: return
 
         if HAS_MULTIMEDIA:
+            self.media_player.stop()
             self.media_player.setSource(QUrl(stream_url))
             self.media_player.play()
         else:
-            # Fallback to external player (ffplay)
+            # Attempt FFplay embedding
+            self.cleanup_ffplay()
+
+            # Get Window ID of the widget
             try:
-                # Pass User-Agent to ffplay
-                cmd = ['ffplay', '-user_agent', USER_AGENT, '-autoexit', stream_url]
-                subprocess.Popen(cmd)
-            except FileNotFoundError:
-                QMessageBox.critical(self, "Error", "ffplay not found. Please ensure FFmpeg is installed.")
+                win_id = int(video_widget.winId())
+
+                # Prepare Env
+                env = os.environ.copy()
+                env['SDL_WINDOWID'] = str(win_id)
+
+                # Command
+                cmd = [
+                    'ffplay',
+                    '-user_agent', USER_AGENT,
+                    '-noborder',
+                    '-infbuf', # Low latency
+                    '-loglevel', 'quiet',
+                    '-x', str(video_widget.width()), # Hint size
+                    '-y', str(video_widget.height()),
+                    stream_url
+                ]
+
+                self.ffplay_process = subprocess.Popen(cmd, env=env)
+
+            except Exception as e:
+                logging.error(f"Failed to embed ffplay: {e}")
+                # Fallback? Maybe just log.
+
+    def play_selected_external(self):
+        # ... (Existing code for play_selected_external) ...
+        # Determine current tab
+        current_tab_idx = self.tabs.currentIndex()
+        table = None
+        if current_tab_idx == 0: table = self.live_table
+        elif current_tab_idx == 1: table = self.vod_table
+        elif current_tab_idx == 2: table = self.series_table
+
+        if not table: return
+
+        # Get selected row
+        selected_items = table.selectedItems()
+        if not selected_items:
+            QMessageBox.information(self, "Play Selected", "Please select a channel/stream first.")
+            return
+
+        row = selected_items[0].row()
+        stream_url = self.get_stream_url(table, row)
+
+        if not stream_url:
+            QMessageBox.information(self, "Info", "Could not determine stream URL.")
+            return
+
+        try:
+            # Ensure SDL_WINDOWID is NOT set for external playback
+            env = os.environ.copy()
+            if 'SDL_WINDOWID' in env:
+                del env['SDL_WINDOWID']
+
+            # Pass User-Agent to ffplay and open in separate window (default behavior)
+            cmd = ['ffplay', '-user_agent', USER_AGENT, '-autoexit', '-window_title', f"Stream: {table.item(row, 1).text()}", stream_url]
+            subprocess.Popen(cmd, env=env)
+        except FileNotFoundError:
+            QMessageBox.critical(self, "Error", "ffplay not found. Please ensure FFmpeg is installed and in your system PATH.")
 
     def load_epg_for_stream(self, stream_id):
         # Determine which list widget to use based on current tab
