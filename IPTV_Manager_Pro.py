@@ -391,6 +391,21 @@ def parse_get_php_url(url_string):
 # =============================================================================
 API_HEADERS = {'User-Agent': USER_AGENT}
 
+def decode_base64_text(text):
+    """
+    Attempts to decode Base64 text. Returns original text if decoding fails.
+    Used for Xtream Codes EPG data which is often Base64 encoded.
+    """
+    if not text:
+        return ""
+    try:
+        # Check if it looks like base64
+        # (This is a heuristic; XC usually encodes everything or nothing)
+        decoded_bytes = base64.b64decode(text, validate=True)
+        return decoded_bytes.decode('utf-8', 'ignore')
+    except Exception:
+        return text
+
 def resolve_dns_ip(url_string):
     """Resolves the IP address of the hostname in the given URL."""
     try:
@@ -3186,6 +3201,13 @@ class MainWindow(QMainWindow):
 # =============================================================================
 # APPLICATION ENTRY POINT
 # =============================================================================
+import traceback
+def excepthook(exc_type, exc_value, exc_traceback):
+    print(">>> UNCAUGHT EXCEPTION <<<")
+    traceback.print_exception(exc_type, exc_value, exc_traceback)
+
+sys.excepthook = excepthook
+
 if __name__ == "__main__":
     logging.getLogger().setLevel(logging.DEBUG)
     logging.info("Application starting with DEBUG level logging.")
@@ -3215,28 +3237,3 @@ if __name__ == "__main__":
     main_window = MainWindow()
     main_window.show()
     sys.exit(app.exec())
-
-
-    import traceback
-import sys
-
-def excepthook(exc_type, exc_value, exc_traceback):
-    print(">>> UNCAUGHT EXCEPTION <<<")
-    traceback.print_exception(exc_type, exc_value, exc_traceback)
-    input("Press Enter to exit...")
-
-sys.excepthook = excepthook
-def decode_base64_text(text):
-    """
-    Attempts to decode Base64 text. Returns original text if decoding fails.
-    Used for Xtream Codes EPG data which is often Base64 encoded.
-    """
-    if not text:
-        return ""
-    try:
-        # Check if it looks like base64
-        # (This is a heuristic; XC usually encodes everything or nothing)
-        decoded_bytes = base64.b64decode(text, validate=True)
-        return decoded_bytes.decode('utf-8', 'ignore')
-    except Exception:
-        return text
