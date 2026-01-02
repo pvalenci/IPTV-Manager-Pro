@@ -1428,17 +1428,25 @@ class PlaylistViewerDialog(QDialog):
 
         main_layout.addWidget(splitter)
 
+        # Status Label (Highlighted functionality)
+        status_label = QLabel("Loaded 0 items.")
+        status_label.setStyleSheet("color: gray; padding: 5px;")
+        main_layout.addWidget(status_label)
+
         # Store references (updated for ListWidget)
         if title == "Live TV":
             self.live_table = table
+            self.live_status_label = status_label
             self.live_group_list = list_widget
             self.live_group_list.currentItemChanged.connect(self.filter_live_streams)
         elif title == "VOD":
             self.vod_table = table
+            self.vod_status_label = status_label
             self.vod_group_list = list_widget
             self.vod_group_list.currentItemChanged.connect(self.filter_vod_streams)
         elif title == "Series":
             self.series_table = table
+            self.series_status_label = status_label
             self.series_group_list = list_widget
             self.series_group_list.currentItemChanged.connect(self.filter_series_streams)
 
@@ -1545,11 +1553,35 @@ class PlaylistViewerDialog(QDialog):
         if not current_item: return
         cat_id = current_item.data(Qt.UserRole)
 
-        if cat_id is None:
-            self.populate_table(table, all_data, cat_map)
-        else:
+        filtered = all_data
+        if cat_id is not None:
             filtered = [x for x in all_data if str(x.get('category_id', '')) == str(cat_id)]
-            self.populate_table(table, filtered, cat_map)
+
+        self.populate_table(table, filtered, cat_map)
+
+        # Update status label
+        count = len(filtered)
+        type_name = "items"
+        singular_type = "item"
+
+        if table == self.live_table:
+            type_name = "channels"
+            singular_type = "channel"
+        elif table == self.vod_table:
+            type_name = "movies"
+            singular_type = "movie"
+        elif table == self.series_table:
+            type_name = "series"
+            singular_type = "series"
+
+        status_text = f"Loaded {count} {type_name}. Select a {singular_type} to view its guide."
+
+        if table == self.live_table:
+            self.live_status_label.setText(status_text)
+        elif table == self.vod_table:
+            self.vod_status_label.setText(status_text)
+        elif table == self.series_table:
+            self.series_status_label.setText(status_text)
 
     def play_playlist_ffplay(self):
         m3u_url = f"{self.server_url}/get.php?username={self.username}&password={self.password}&type=m3u_plus&output=ts"
