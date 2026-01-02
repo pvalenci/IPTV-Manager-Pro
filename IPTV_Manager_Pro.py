@@ -1310,6 +1310,7 @@ class PlaylistViewerDialog(QDialog):
 
         # --- Left Panel: Groups (QListWidget) ---
         list_widget = QListWidget()
+        list_widget.setUniformItemSizes(True) # Optimization and helps with fixed height
         list_widget.setStyleSheet("""
             QListWidget {
                 background-color: #f9f9f9;
@@ -1318,7 +1319,8 @@ class PlaylistViewerDialog(QDialog):
                 color: #333;
             }
             QListWidget::item {
-                padding: 5px; /* Increased padding */
+                height: 24px; /* Force height to match channel table rows (24px) */
+                padding: 0px 5px; /* Adjust padding to center text vertically */
                 border-bottom: 1px solid #eee;
             }
             QListWidget::item:selected {
