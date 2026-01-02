@@ -73,7 +73,7 @@ def resource_path(relative_path):
         # PyInstaller creates a temp folder and stores path in _MEIPASS
         base_path = sys._MEIPASS
     except Exception:
-        base_path = os.path.abspath(".")
+        base_path = os.path.dirname(os.path.abspath(__file__))
 
     return os.path.join(base_path, relative_path)
 
@@ -1307,10 +1307,10 @@ class PlaylistViewerDialog(QDialog):
 
         # Open Source Button
         btn_layout = QHBoxLayout()
-        self.play_playlist_btn = QPushButton("Play Playlist with ffplay")
-        self.play_playlist_btn.clicked.connect(self.play_playlist_ffplay)
+        self.play_selected_external_btn = QPushButton("Play Selected in New Window")
+        self.play_selected_external_btn.clicked.connect(self.play_selected_external)
         btn_layout.addStretch()
-        btn_layout.addWidget(self.play_playlist_btn)
+        btn_layout.addWidget(self.play_selected_external_btn)
         layout.addLayout(btn_layout)
 
         # Load data thread
@@ -1618,11 +1618,32 @@ class PlaylistViewerDialog(QDialog):
         elif table == self.series_table:
             self.series_status_label.setText(status_text)
 
-    def play_playlist_ffplay(self):
-        m3u_url = f"{self.server_url.rstrip('/')}/get.php?username={self.username}&password={self.password}&type=m3u_plus&output=ts"
+    def play_selected_external(self):
+        # Determine current tab
+        current_tab_idx = self.tabs.currentIndex()
+        table = None
+        if current_tab_idx == 0: table = self.live_table
+        elif current_tab_idx == 1: table = self.vod_table
+        elif current_tab_idx == 2: table = self.series_table
+
+        if not table: return
+
+        # Get selected row
+        selected_items = table.selectedItems()
+        if not selected_items:
+            QMessageBox.information(self, "Play Selected", "Please select a channel/stream first.")
+            return
+
+        row = selected_items[0].row()
+        stream_url = self.get_stream_url(table, row)
+
+        if not stream_url:
+            QMessageBox.information(self, "Info", "Could not determine stream URL.")
+            return
+
         try:
-            # Pass User-Agent to ffplay
-            cmd = ['ffplay', '-user_agent', USER_AGENT, m3u_url]
+            # Pass User-Agent to ffplay and open in separate window (default behavior)
+            cmd = ['ffplay', '-user_agent', USER_AGENT, '-autoexit', '-window_title', f"Stream: {table.item(row, 1).text()}", stream_url]
             subprocess.Popen(cmd)
         except FileNotFoundError:
             QMessageBox.critical(self, "Error", "ffplay not found. Please ensure FFmpeg is installed and in your system PATH.")
