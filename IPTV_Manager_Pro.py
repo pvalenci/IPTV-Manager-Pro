@@ -17,7 +17,6 @@ import csv
 import re # Added for MAC address validation
 import socket # Added for DNS lookup
 import subprocess # Added for ffplay
-import base64 # Added for EPG decoding
 from typing import Optional # Added for type hinting
 # import html # Not currently used
 from urllib.parse import urlparse, parse_qs
@@ -500,21 +499,22 @@ def get_series_categories(server_base_url, username, password, session=None):
         logging.error(f"Error fetching series categories: {e}")
         return []
 
-def get_short_epg(server_base_url, username, password, stream_id, limit=50, session=None):
+def get_epg_for_stream(server_base_url, username, password, stream_id, session=None):
+    """Fetches EPG using get_simple_data_table action (Full EPG)."""
     if not session: session = requests.Session()
-    api_url = f"{server_base_url.rstrip('/')}/player_api.php?username={username}&password={password}&action=get_short_epg&stream_id={stream_id}&limit={limit}"
+    api_url = f"{server_base_url.rstrip('/')}/player_api.php?username={username}&password={password}&action=get_simple_data_table&stream_id={stream_id}"
     try:
         response = session.get(api_url, timeout=10, headers=API_HEADERS)
         response.raise_for_status()
         data = response.json()
-        # Handle different EPG response formats
+        # Handle different EPG response formats (get_simple_data_table usually returns object with epg_listings)
         if isinstance(data, dict) and "epg_listings" in data:
             return data["epg_listings"]
         elif isinstance(data, list):
             return data
         return []
     except Exception as e:
-        logging.error(f"Error fetching short EPG for stream {stream_id}: {e}")
+        logging.error(f"Error fetching EPG for stream {stream_id}: {e}")
         return []
 
 def check_account_status_detailed_api(server_base_url, username, password, session):
@@ -1620,7 +1620,7 @@ class PlaylistViewerDialog(QDialog):
         QApplication.processEvents()
 
         try:
-            epg_data = get_short_epg(self.server_url, self.username, self.password, stream_id)
+            epg_data = get_epg_for_stream(self.server_url, self.username, self.password, stream_id)
             epg_list.clear()
 
             if not epg_data:
@@ -1635,12 +1635,19 @@ class PlaylistViewerDialog(QDialog):
 
             for prog in epg_data:
                 # Structure: start, end, title, description, start_timestamp, stop_timestamp
-                # Attempt to decode title/desc if they are base64 (common in XC)
-                title = decode_xc_text(prog.get('title'))
-                desc = decode_xc_text(prog.get('description', ''))
+                title = prog.get('title')
+                desc = prog.get('description', '')
 
-                start_ts = int(prog.get('start_timestamp', 0))
-                stop_ts = int(prog.get('stop_timestamp', 0))
+                # get_simple_data_table might use different keys or format?
+                # Usually it has 'title', 'description', 'start_timestamp', 'stop_timestamp' just like short epg.
+                # It might also have 'start' and 'end' as strings.
+
+                start_ts_val = prog.get('start_timestamp', 0)
+                stop_ts_val = prog.get('stop_timestamp', 0)
+
+                # Ensure integer casting handles strings
+                start_ts = int(start_ts_val) if start_ts_val else 0
+                stop_ts = int(stop_ts_val) if stop_ts_val else 0
 
                 # Format time
                 # Convert UTC timestamp to local display time
@@ -3183,17 +3190,3 @@ def excepthook(exc_type, exc_value, exc_traceback):
     input("Press Enter to exit...")
 
 sys.excepthook = excepthook
-def decode_xc_text(text):
-    """
-    Attempts to decode text that might be Base64 encoded (common in Xtream Codes API).
-    Falls back to the original text if decoding fails.
-    """
-    if not text:
-        return ""
-    try:
-        # Check if it looks like base64
-        # (This is a heuristic; XC usually encodes everything or nothing)
-        decoded_bytes = base64.b64decode(text, validate=True)
-        return decoded_bytes.decode('utf-8')
-    except Exception:
-        return text
