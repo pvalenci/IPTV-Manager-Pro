@@ -1313,8 +1313,23 @@ class PlaylistViewerDialog(QDialog):
         btn_layout.addWidget(self.play_playlist_btn)
         layout.addLayout(btn_layout)
 
-        # Load data (could be threaded, simple direct call for MVP)
-        QTimer.singleShot(100, self.load_data)
+        # Load data thread
+        self.load_worker = PlaylistLoaderWorker(self.server_url, self.username, self.password)
+        self.load_thread = QThread()
+        self.load_worker.moveToThread(self.load_thread)
+
+        self.load_thread.started.connect(self.load_worker.load_all)
+        self.load_worker.data_ready.connect(self.on_data_loaded)
+        self.load_worker.error_occurred.connect(self.on_load_error)
+        self.load_worker.finished.connect(self.load_thread.quit)
+        self.load_worker.finished.connect(self.load_worker.deleteLater)
+        self.load_thread.finished.connect(self.load_thread.deleteLater)
+
+        self.live_status_label.setText("Loading playlist data... Please wait.")
+        self.vod_status_label.setText("Loading playlist data... Please wait.")
+        self.series_status_label.setText("Loading playlist data... Please wait.")
+
+        self.load_thread.start()
 
     def setup_tab(self, tab_widget, title):
         # Use QSplitter for resizable panels
@@ -1466,20 +1481,19 @@ class PlaylistViewerDialog(QDialog):
             self.series_group_list = list_widget
             self.series_group_list.currentItemChanged.connect(self.filter_series_streams)
 
-    def load_data(self):
-        # Fetch Categories
-        live_cats = get_live_categories(self.server_url, self.username, self.password)
-        vod_cats = get_vod_categories(self.server_url, self.username, self.password)
-        series_cats = get_series_categories(self.server_url, self.username, self.password)
+    @Slot(dict)
+    def on_data_loaded(self, data):
+        # Unpack data
+        live_cats = data['live_cats']
+        vod_cats = data['vod_cats']
+        series_cats = data['series_cats']
+        self.live_streams = data['live_streams']
+        self.vod_streams = data['vod_streams']
+        self.series_streams = data['series_streams']
 
         self.populate_list(self.live_group_list, live_cats)
         self.populate_list(self.vod_group_list, vod_cats)
         self.populate_list(self.series_group_list, series_cats)
-
-        # Fetch Streams
-        self.live_streams = get_live_streams_all(self.server_url, self.username, self.password)
-        self.vod_streams = get_vod_streams_all(self.server_url, self.username, self.password)
-        self.series_streams = get_series_all(self.server_url, self.username, self.password)
 
         # Map categories for quick lookup (ID -> Name)
         self.live_cat_map = {str(c.get('category_id')): c.get('category_name') for c in live_cats}
@@ -1501,6 +1515,11 @@ class PlaylistViewerDialog(QDialog):
             self.tabs.currentChanged.connect(self.on_tab_changed)
             # Set initial output
             self.on_tab_changed(self.tabs.currentIndex())
+
+    @Slot(str)
+    def on_load_error(self, error_msg):
+        QMessageBox.warning(self, "Load Error", f"Failed to load playlist data: {error_msg}")
+        self.live_status_label.setText("Error loading data.")
 
     def on_tab_changed(self, index):
         if not HAS_MULTIMEDIA: return
@@ -1600,9 +1619,11 @@ class PlaylistViewerDialog(QDialog):
             self.series_status_label.setText(status_text)
 
     def play_playlist_ffplay(self):
-        m3u_url = f"{self.server_url}/get.php?username={self.username}&password={self.password}&type=m3u_plus&output=ts"
+        m3u_url = f"{self.server_url.rstrip('/')}/get.php?username={self.username}&password={self.password}&type=m3u_plus&output=ts"
         try:
-            subprocess.Popen(['ffplay', m3u_url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            # Pass User-Agent to ffplay
+            cmd = ['ffplay', '-user_agent', USER_AGENT, m3u_url]
+            subprocess.Popen(cmd)
         except FileNotFoundError:
             QMessageBox.critical(self, "Error", "ffplay not found. Please ensure FFmpeg is installed and in your system PATH.")
 
@@ -1622,7 +1643,7 @@ class PlaylistViewerDialog(QDialog):
         if stream_type == "series":
              return None # Block series for now or handle differently
 
-        return f"{self.server_url}/{stream_type}/{self.username}/{self.password}/{stream_id}.{extension}"
+        return f"{self.server_url.rstrip('/')}/{stream_type}/{self.username}/{self.password}/{stream_id}.{extension}"
 
     def play_stream_from_table_doubleclick(self, index):
         table = self.sender()
@@ -1651,7 +1672,9 @@ class PlaylistViewerDialog(QDialog):
         else:
             # Fallback to external player (ffplay)
             try:
-                subprocess.Popen(['ffplay', '-autoexit', stream_url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                # Pass User-Agent to ffplay
+                cmd = ['ffplay', '-user_agent', USER_AGENT, '-autoexit', stream_url]
+                subprocess.Popen(cmd)
             except FileNotFoundError:
                 QMessageBox.critical(self, "Error", "ffplay not found. Please ensure FFmpeg is installed.")
 
@@ -1743,6 +1766,47 @@ class PlaylistViewerDialog(QDialog):
 # =============================================================================
 # API CHECKER WORKER
 # =============================================================================
+class PlaylistLoaderWorker(QObject):
+    data_ready = Signal(dict)
+    error_occurred = Signal(str)
+    finished = Signal()
+
+    def __init__(self, server_url, username, password):
+        super().__init__()
+        self.server_url = server_url
+        self.username = username
+        self.password = password
+
+    @Slot()
+    def load_all(self):
+        try:
+            # Create a session for reuse
+            session = requests.Session()
+
+            # Fetch Categories
+            live_cats = get_live_categories(self.server_url, self.username, self.password, session)
+            vod_cats = get_vod_categories(self.server_url, self.username, self.password, session)
+            series_cats = get_series_categories(self.server_url, self.username, self.password, session)
+
+            # Fetch Streams
+            live_streams = get_live_streams_all(self.server_url, self.username, self.password, session)
+            vod_streams = get_vod_streams_all(self.server_url, self.username, self.password, session)
+            series_streams = get_series_all(self.server_url, self.username, self.password, session)
+
+            data = {
+                'live_cats': live_cats,
+                'vod_cats': vod_cats,
+                'series_cats': series_cats,
+                'live_streams': live_streams,
+                'vod_streams': vod_streams,
+                'series_streams': series_streams
+            }
+            self.data_ready.emit(data)
+        except Exception as e:
+            self.error_occurred.emit(str(e))
+        finally:
+            self.finished.emit()
+
 class ApiCheckerWorker(QObject):
     result_ready = Signal(int, dict)
     status_message_updated = Signal(str)
