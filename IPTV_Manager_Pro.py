@@ -15,6 +15,7 @@ import logging
 import time
 import csv
 import re # Added for MAC address validation
+import base64
 from typing import Optional # Added for type hinting
 # import html # Not currently used
 from urllib.parse import urlparse, parse_qs
@@ -341,6 +342,24 @@ def parse_get_php_url(url_string):
 # API UTILITIES
 # =============================================================================
 API_HEADERS = {'User-Agent': USER_AGENT}
+
+def decode_base64_text(text):
+    """
+    Tries to decode a base64 string. Returns the decoded string if successful and looks like a URL,
+    otherwise returns None.
+    """
+    try:
+        if ' ' in text or len(text) < 10:
+            return None
+        decoded_bytes = base64.b64decode(text, validate=True)
+        decoded_str = decoded_bytes.decode('utf-8').strip()
+        # Basic validation: We expect a URL or something actionable
+        if decoded_str.startswith('http') or 'paste.sh' in decoded_str:
+            return decoded_str
+        return None
+    except Exception:
+        return None
+
 def get_safe_api_value(data_dict, key, default=None):
     if not isinstance(data_dict, dict): return default
     value = data_dict.get(key); return default if value == "" else value
@@ -1210,6 +1229,298 @@ class EntryFilterProxyModel(QSortFilterProxyModel):
         return True
 
 # =============================================================================
+# REDDIT & PASTE SCRAPER UTILITIES
+# =============================================================================
+class RedditScraper:
+    def __init__(self):
+        self.session = requests.Session()
+        self.session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        })
+
+    def fetch_reddit_data(self, url):
+        """
+        Fetches the JSON representation of a Reddit thread.
+        Appends .json to the URL if not present.
+        """
+        if not url.endswith('.json'):
+            url = url.rstrip('/') + '.json'
+
+        try:
+            logging.info(f"Fetching Reddit data from: {url}")
+            response = self.session.get(url, timeout=10)
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            logging.error(f"Error fetching Reddit data: {e}")
+            raise
+
+    def extract_comments(self, json_data):
+        """
+        Traverses the Reddit JSON structure to extract all selftext and body content.
+        """
+        text_content = []
+
+        def traverse(obj):
+            if isinstance(obj, dict):
+                # Extract 'selftext' from the main post
+                if 'selftext' in obj:
+                    text_content.append(obj['selftext'])
+                # Extract 'body' from comments
+                if 'body' in obj:
+                    text_content.append(obj['body'])
+
+                for key, value in obj.items():
+                    traverse(value)
+            elif isinstance(obj, list):
+                for item in obj:
+                    traverse(item)
+
+        traverse(json_data)
+        return text_content
+
+    def find_and_decode(self, content_list):
+        """
+        Scans a list of text strings for Base64 encoded links.
+        """
+        found_links = set()
+        for content in content_list:
+            if not content: continue
+            # Find alphanumeric strings that might be base64
+            potential_matches = re.findall(r'[A-Za-z0-9+/=]{20,}', content)
+            for match in potential_matches:
+                decoded = decode_base64_text(match)
+                if decoded:
+                    found_links.add(decoded)
+        return list(found_links)
+
+    def process_paste_sh(self, url):
+        """
+        Fetches content from a paste.sh URL.
+        Tries to access the raw version if possible.
+        """
+        if 'paste.sh' in url and not url.endswith('/raw'):
+            # Construct raw URL: paste.sh/ID -> paste.sh/ID/raw if structure matches,
+            # but usually appending /raw works or checking the structure.
+            # paste.sh URLs often look like https://paste.sh/<code>
+            # The raw endpoint is typically just the same url.
+            # Actually, for paste.sh, the raw content is often just the text on the page
+            # or requires a specific endpoint. Let's try fetching the URL directly first.
+            pass
+
+        try:
+            logging.info(f"Fetching paste content from: {url}")
+            response = self.session.get(url, timeout=10)
+            response.raise_for_status()
+            return response.text
+        except Exception as e:
+            logging.error(f"Error fetching paste content: {e}")
+            return ""
+
+    def parse_credentials(self, text):
+        """
+        Parses text for IPTV credentials.
+        Supports:
+        1. M3U Links (http://.../get.php?...)
+        2. Format: Server URL username password
+        """
+        results = []
+        lines = text.splitlines()
+
+        # Regex for standard XTream codes pattern in plain text
+        # Looks for "server user pass" or similar combinations
+        # This is heuristics-based.
+
+        for line in lines:
+            line = line.strip()
+            if not line: continue
+
+            # 1. Check for get.php style URL
+            if 'get.php?' in line:
+                parsed = parse_get_php_url(line)
+                if parsed and not parsed.get('error'):
+                    results.append(parsed)
+                    continue
+
+            # 2. Heuristic: Server URL (http/https) followed by User and Pass
+            # Split by whitespace
+            parts = line.split()
+            if len(parts) >= 3:
+                # Assume first part is URL if it starts with http
+                if parts[0].startswith('http'):
+                    url = parts[0]
+                    user = parts[1]
+                    password = parts[2]
+                    # Basic sanity check
+                    if len(user) > 0 and len(password) > 0:
+                        results.append({
+                            'server_base_url': url,
+                            'username': user,
+                            'password': password,
+                            'error': None
+                        })
+                        continue
+
+        return results
+
+class RedditImportDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Import from Reddit")
+        self.setMinimumWidth(600)
+        self.setMinimumHeight(500)
+
+        layout = QVBoxLayout(self)
+
+        # Input Area
+        input_layout = QHBoxLayout()
+        self.url_edit = QLineEdit()
+        self.url_edit.setPlaceholderText("Paste Reddit Thread URL here...")
+        self.scrape_button = QPushButton("Scrape Thread")
+        input_layout.addWidget(QLabel("Reddit URL:"))
+        input_layout.addWidget(self.url_edit)
+        input_layout.addWidget(self.scrape_button)
+        layout.addLayout(input_layout)
+
+        # Log/Status Area
+        self.log_viewer = QListWidget()
+        self.log_viewer.setMaximumHeight(100)
+        layout.addWidget(QLabel("Status Log:"))
+        layout.addWidget(self.log_viewer)
+
+        # Results Preview
+        self.results_table = QTableView()
+        self.results_model = QStandardItemModel(0, 4)
+        self.results_model.setHorizontalHeaderLabels(["Name", "Server", "Username", "Password"])
+        self.results_table.setModel(self.results_model)
+        self.results_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.results_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        layout.addWidget(QLabel("Found Credentials:"))
+        layout.addWidget(self.results_table)
+
+        # Action Buttons
+        btn_box = QDialogButtonBox(QDialogButtonBox.Cancel)
+        self.import_btn = QPushButton("Import Selected")
+        btn_box.addButton(self.import_btn, QDialogButtonBox.ActionRole)
+
+        btn_box.rejected.connect(self.reject)
+        self.import_btn.clicked.connect(self.import_selected)
+        self.scrape_button.clicked.connect(self.start_scraping)
+
+        layout.addWidget(btn_box)
+
+        self.scraper = RedditScraper()
+        self.found_entries = []
+
+    def log(self, message):
+        self.log_viewer.addItem(message)
+        self.log_viewer.scrollToBottom()
+        QApplication.processEvents()
+
+    def start_scraping(self):
+        url = self.url_edit.text().strip()
+        if not url:
+            QMessageBox.warning(self, "Input Error", "Please enter a Reddit URL.")
+            return
+
+        self.log_viewer.clear()
+        self.results_model.removeRows(0, self.results_model.rowCount())
+        self.found_entries = []
+        self.log(f"Starting scrape for: {url}")
+
+        try:
+            # Step 1: Fetch Reddit Data
+            self.log("Fetching Reddit thread data...")
+            json_data = self.scraper.fetch_reddit_data(url)
+
+            # Step 2: Extract Comments/Text
+            self.log("Extracting comments...")
+            texts = self.scraper.extract_comments(json_data)
+            self.log(f"Found {len(texts)} text blocks to scan.")
+
+            # Step 3: Find Base64 Links
+            self.log("Scanning for Base64 encoded links...")
+            links = self.scraper.find_and_decode(texts)
+            self.log(f"Found {len(links)} potential decoded links.")
+
+            for link in links:
+                self.log(f"Processing link: {link}")
+                content = self.scraper.process_paste_sh(link)
+                if content:
+                    creds = self.scraper.parse_credentials(content)
+                    if creds:
+                        self.log(f"  -> Found {len(creds)} credentials in link.")
+                        for c in creds:
+                            self.add_candidate(c)
+                    else:
+                        self.log("  -> No credentials found in this link.")
+                else:
+                    self.log("  -> Failed to fetch content.")
+
+            if self.results_model.rowCount() == 0:
+                QMessageBox.information(self, "Scrape Complete", "No credentials found.")
+            else:
+                QMessageBox.information(self, "Scrape Complete", f"Found {self.results_model.rowCount()} potential entries.")
+
+        except Exception as e:
+            self.log(f"Error: {str(e)}")
+            QMessageBox.critical(self, "Scrape Error", f"An error occurred: {e}")
+
+    def add_candidate(self, cred_data):
+        self.found_entries.append(cred_data)
+
+        row = []
+        # Auto-generate a name
+        try:
+            host = urlparse(cred_data['server_base_url']).hostname or "server"
+        except:
+            host = "server"
+        name = f"RedditImport_{host}_{cred_data['username']}"
+        cred_data['display_name'] = name # Store for later
+
+        row.append(QStandardItem(name))
+        row.append(QStandardItem(cred_data['server_base_url']))
+        row.append(QStandardItem(cred_data['username']))
+        row.append(QStandardItem(cred_data['password']))
+
+        for item in row:
+            item.setEditable(False)
+
+        self.results_model.appendRow(row)
+
+    def import_selected(self):
+        selected_rows = self.results_table.selectionModel().selectedRows()
+        if not selected_rows:
+            # If nothing selected, ask to import all?
+            reply = QMessageBox.question(self, "Import All?", "No specific rows selected. Import ALL found entries?", QMessageBox.Yes | QMessageBox.No)
+            if reply == QMessageBox.Yes:
+                rows_to_import = range(self.results_model.rowCount())
+            else:
+                return
+        else:
+            rows_to_import = [idx.row() for idx in selected_rows]
+
+        count = 0
+        for row_idx in rows_to_import:
+            if row_idx < len(self.found_entries):
+                data = self.found_entries[row_idx]
+                try:
+                    add_entry(
+                        data['display_name'],
+                        "Uncategorized",
+                        data['server_base_url'],
+                        data['username'],
+                        data['password']
+                    )
+                    count += 1
+                except Exception as e:
+                    self.log(f"Error importing {data['display_name']}: {e}")
+
+        QMessageBox.information(self, "Import Success", f"Successfully imported {count} entries.")
+        self.accept()
+
+
+# =============================================================================
 # MAIN APPLICATION WINDOW
 # =============================================================================
 COLUMN_HEADERS = ["ID", "Name", "Category", "API Status", "Channels", "Movies", "Series", "Expires", "Trial?", "Active", "Max", "Last Checked", "Server", "User / MAC", "Password", "Message"]
@@ -1241,6 +1552,11 @@ class MainWindow(QMainWindow):
         import_file_action = QAction("Import from &File...", self)
         import_file_action.triggered.connect(self.import_from_file_action)
         file_menu.addAction(import_file_action)
+
+        import_reddit_action = QAction("Import from &Reddit...", self)
+        import_reddit_action.triggered.connect(self.import_from_reddit_action)
+        file_menu.addAction(import_reddit_action)
+
         file_menu.addSeparator()
         export_clipboard_action = QAction("Copy Link for Current Entry", self)
         export_clipboard_action.triggered.connect(self.export_current_to_clipboard)
@@ -1665,6 +1981,13 @@ class MainWindow(QMainWindow):
         dialog = ImportUrlDialog(parent=self)
         if dialog.exec():
             self.load_entries_to_table(); self.update_category_filter_combo()
+
+    @Slot()
+    def import_from_reddit_action(self):
+        dialog = RedditImportDialog(parent=self)
+        if dialog.exec():
+            self.load_entries_to_table()
+            self.update_category_filter_combo()
 
     @Slot()
     def import_from_file_action(self):
