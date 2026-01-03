@@ -1241,14 +1241,24 @@ class RedditScraper:
     def fetch_reddit_data(self, url):
         """
         Fetches the JSON representation of a Reddit thread.
-        Appends .json to the URL if not present.
+        Correctly handles query parameters.
         """
-        if not url.endswith('.json'):
-            url = url.rstrip('/') + '.json'
-
         try:
-            logging.info(f"Fetching Reddit data from: {url}")
-            response = self.session.get(url, timeout=10)
+            parsed = urlparse(url)
+            # Ensure path ends with .json
+            path = parsed.path.rstrip('/')
+            if not path.endswith('.json'):
+                path += '.json'
+
+            # Reconstruct URL
+            # Note: Reddit API often ignores query params on .json endpoints or handles them differently,
+            # but usually we just want the base thread content.
+            # Safest is to strip query params unless we specifically want sorting.
+            # Let's keep query params but ensure .json is before them.
+            new_url = parsed._replace(path=path).geturl()
+
+            logging.info(f"Fetching Reddit data from: {new_url}")
+            response = self.session.get(new_url, timeout=10)
             response.raise_for_status()
             return response.json()
         except Exception as e:
@@ -1299,14 +1309,15 @@ class RedditScraper:
         Fetches content from a paste.sh URL.
         Tries to access the raw version if possible.
         """
-        if 'paste.sh' in url and not url.endswith('/raw'):
-            # Construct raw URL: paste.sh/ID -> paste.sh/ID/raw if structure matches,
-            # but usually appending /raw works or checking the structure.
-            # paste.sh URLs often look like https://paste.sh/<code>
-            # The raw endpoint is typically just the same url.
-            # Actually, for paste.sh, the raw content is often just the text on the page
-            # or requires a specific endpoint. Let's try fetching the URL directly first.
-            pass
+        # Transform paste.sh URL to raw version
+        # Format: https://paste.sh/<id> -> https://paste.sh/<id>/raw
+        # or https://paste.sh/<id>/<key> -> https://paste.sh/<id>/<key>/raw
+
+        if 'paste.sh' in url:
+            # Strip trailing slash
+            url = url.rstrip('/')
+            if not url.endswith('/raw'):
+                url += '/raw'
 
         try:
             logging.info(f"Fetching paste content from: {url}")
@@ -1363,6 +1374,64 @@ class RedditScraper:
 
         return results
 
+class ScraperWorker(QObject):
+    log_message = Signal(str)
+    candidate_found = Signal(dict)
+    finished = Signal()
+    error_occurred = Signal(str)
+
+    def __init__(self, url):
+        super().__init__()
+        self.url = url
+        self.scraper = RedditScraper()
+        self._is_running = True
+
+    @Slot()
+    def run(self):
+        try:
+            self.log_message.emit(f"Starting scrape for: {self.url}")
+
+            # Step 1: Fetch Reddit Data
+            if not self._is_running: return
+            self.log_message.emit("Fetching Reddit thread data...")
+            json_data = self.scraper.fetch_reddit_data(self.url)
+
+            # Step 2: Extract Comments
+            if not self._is_running: return
+            self.log_message.emit("Extracting comments...")
+            texts = self.scraper.extract_comments(json_data)
+            self.log_message.emit(f"Found {len(texts)} text blocks to scan.")
+
+            # Step 3: Find Base64 Links
+            if not self._is_running: return
+            self.log_message.emit("Scanning for Base64 encoded links...")
+            links = self.scraper.find_and_decode(texts)
+            self.log_message.emit(f"Found {len(links)} potential decoded links.")
+
+            for link in links:
+                if not self._is_running: break
+                self.log_message.emit(f"Processing link: {link}")
+                content = self.scraper.process_paste_sh(link)
+                if content:
+                    creds = self.scraper.parse_credentials(content)
+                    if creds:
+                        self.log_message.emit(f"  -> Found {len(creds)} credentials in link.")
+                        for c in creds:
+                            self.candidate_found.emit(c)
+                    else:
+                        self.log_message.emit("  -> No credentials found in this link.")
+                else:
+                    self.log_message.emit("  -> Failed to fetch content.")
+
+            self.finished.emit()
+
+        except Exception as e:
+            self.error_occurred.emit(str(e))
+            self.finished.emit()
+
+    def stop(self):
+        self._is_running = False
+
 class RedditImportDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1401,6 +1470,7 @@ class RedditImportDialog(QDialog):
         # Action Buttons
         btn_box = QDialogButtonBox(QDialogButtonBox.Cancel)
         self.import_btn = QPushButton("Import Selected")
+        self.import_btn.setEnabled(False) # Disable until we have results
         btn_box.addButton(self.import_btn, QDialogButtonBox.ActionRole)
 
         btn_box.rejected.connect(self.reject)
@@ -1409,13 +1479,14 @@ class RedditImportDialog(QDialog):
 
         layout.addWidget(btn_box)
 
-        self.scraper = RedditScraper()
         self.found_entries = []
+        self.scrape_thread = None
+        self.worker = None
 
+    @Slot(str)
     def log(self, message):
         self.log_viewer.addItem(message)
         self.log_viewer.scrollToBottom()
-        QApplication.processEvents()
 
     def start_scraping(self):
         url = self.url_edit.text().strip()
@@ -1423,51 +1494,33 @@ class RedditImportDialog(QDialog):
             QMessageBox.warning(self, "Input Error", "Please enter a Reddit URL.")
             return
 
+        # Reset UI
         self.log_viewer.clear()
         self.results_model.removeRows(0, self.results_model.rowCount())
         self.found_entries = []
-        self.log(f"Starting scrape for: {url}")
+        self.scrape_button.setEnabled(False)
+        self.import_btn.setEnabled(False)
 
-        try:
-            # Step 1: Fetch Reddit Data
-            self.log("Fetching Reddit thread data...")
-            json_data = self.scraper.fetch_reddit_data(url)
+        # Thread Setup
+        self.scrape_thread = QThread()
+        self.worker = ScraperWorker(url)
+        self.worker.moveToThread(self.scrape_thread)
 
-            # Step 2: Extract Comments/Text
-            self.log("Extracting comments...")
-            texts = self.scraper.extract_comments(json_data)
-            self.log(f"Found {len(texts)} text blocks to scan.")
+        self.scrape_thread.started.connect(self.worker.run)
+        self.worker.log_message.connect(self.log)
+        self.worker.candidate_found.connect(self.add_candidate)
+        self.worker.error_occurred.connect(lambda e: QMessageBox.critical(self, "Scrape Error", f"Error: {e}"))
+        self.worker.finished.connect(self.on_scrape_finished)
+        self.worker.finished.connect(self.scrape_thread.quit)
+        self.worker.finished.connect(self.worker.deleteLater)
+        self.scrape_thread.finished.connect(self.scrape_thread.deleteLater)
 
-            # Step 3: Find Base64 Links
-            self.log("Scanning for Base64 encoded links...")
-            links = self.scraper.find_and_decode(texts)
-            self.log(f"Found {len(links)} potential decoded links.")
+        self.scrape_thread.start()
 
-            for link in links:
-                self.log(f"Processing link: {link}")
-                content = self.scraper.process_paste_sh(link)
-                if content:
-                    creds = self.scraper.parse_credentials(content)
-                    if creds:
-                        self.log(f"  -> Found {len(creds)} credentials in link.")
-                        for c in creds:
-                            self.add_candidate(c)
-                    else:
-                        self.log("  -> No credentials found in this link.")
-                else:
-                    self.log("  -> Failed to fetch content.")
-
-            if self.results_model.rowCount() == 0:
-                QMessageBox.information(self, "Scrape Complete", "No credentials found.")
-            else:
-                QMessageBox.information(self, "Scrape Complete", f"Found {self.results_model.rowCount()} potential entries.")
-
-        except Exception as e:
-            self.log(f"Error: {str(e)}")
-            QMessageBox.critical(self, "Scrape Error", f"An error occurred: {e}")
-
+    @Slot(dict)
     def add_candidate(self, cred_data):
         self.found_entries.append(cred_data)
+        self.import_btn.setEnabled(True)
 
         row = []
         # Auto-generate a name
@@ -1476,7 +1529,7 @@ class RedditImportDialog(QDialog):
         except:
             host = "server"
         name = f"RedditImport_{host}_{cred_data['username']}"
-        cred_data['display_name'] = name # Store for later
+        cred_data['display_name'] = name
 
         row.append(QStandardItem(name))
         row.append(QStandardItem(cred_data['server_base_url']))
@@ -1488,10 +1541,18 @@ class RedditImportDialog(QDialog):
 
         self.results_model.appendRow(row)
 
+    @Slot()
+    def on_scrape_finished(self):
+        self.scrape_button.setEnabled(True)
+        self.log("Scraping finished.")
+        if self.results_model.rowCount() == 0:
+            QMessageBox.information(self, "Scrape Complete", "No credentials found.")
+        else:
+             QMessageBox.information(self, "Scrape Complete", f"Found {self.results_model.rowCount()} potential entries.")
+
     def import_selected(self):
         selected_rows = self.results_table.selectionModel().selectedRows()
         if not selected_rows:
-            # If nothing selected, ask to import all?
             reply = QMessageBox.question(self, "Import All?", "No specific rows selected. Import ALL found entries?", QMessageBox.Yes | QMessageBox.No)
             if reply == QMessageBox.Yes:
                 rows_to_import = range(self.results_model.rowCount())
@@ -1518,6 +1579,14 @@ class RedditImportDialog(QDialog):
 
         QMessageBox.information(self, "Import Success", f"Successfully imported {count} entries.")
         self.accept()
+
+    def closeEvent(self, event):
+        if self.worker:
+            self.worker.stop()
+        if self.scrape_thread and self.scrape_thread.isRunning():
+            self.scrape_thread.quit()
+            self.scrape_thread.wait(1000)
+        event.accept()
 
 
 # =============================================================================

@@ -1,3 +1,0 @@
-2026-01-03 05:52:58,237 - INFO - IPTV_Manager_Pro.py:1250 - Fetching Reddit data from: https://www.reddit.com/r/test.json
-2026-01-03 05:52:58,239 - INFO - IPTV_Manager_Pro.py:1312 - Fetching paste content from: https://paste.sh/XXMockPasteIPTV_ZXZ
-2026-01-03 05:52:58,239 - INFO - IPTV_Manager_Pro.py:335 - Parsed URL: http://server.com:8080, User: user1
