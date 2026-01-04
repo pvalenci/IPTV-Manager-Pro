@@ -74,7 +74,11 @@ try:
     import pychromecast
     HAS_CHROMECAST = True
 except ImportError:
-    print("Warning: 'pychromecast' not found. Casting features will be disabled.")
+    HAS_CHROMECAST = False
+    # Log to both stdout (for console users) and logging (for file log)
+    print("Warning: 'pychromecast' not found. Casting features will be disabled.", file=sys.stderr)
+    # Note: Logging might not be configured yet if this is at module level,
+    # but it's safe to import. We'll rely on the runtime check in the button.
 
 # --- Custom Widgets ---
 class ClickableVideoWidget(QVideoWidget):
@@ -1410,10 +1414,12 @@ class PlaylistViewerDialog(QDialog):
         toolbar_layout.addWidget(mute_btn)
 
         # Chromecast Button
-        if HAS_CHROMECAST:
-            cast_btn = QPushButton("Cast to Device")
-            cast_btn.clicked.connect(self.cast_current_stream)
-            toolbar_layout.addWidget(cast_btn)
+        cast_btn = QPushButton("Cast to Device")
+        cast_btn.clicked.connect(self.cast_current_stream)
+        if not HAS_CHROMECAST:
+            cast_btn.setToolTip("Install 'pychromecast' to enable this feature.")
+            # We keep it enabled so they can click and get the instruction message
+        toolbar_layout.addWidget(cast_btn)
 
         main_layout.addLayout(toolbar_layout)
 
@@ -1628,7 +1634,10 @@ class PlaylistViewerDialog(QDialog):
 
     def cast_current_stream(self):
         if not HAS_CHROMECAST:
-            QMessageBox.warning(self, "Error", "Chromecast support is not installed.")
+            QMessageBox.warning(self, "Missing Dependency",
+                                "The 'pychromecast' library is required for casting.\n\n"
+                                "Please install it by running:\n"
+                                "pip install pychromecast")
             return
 
         # Get current stream
