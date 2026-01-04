@@ -18,6 +18,7 @@ import re # Added for MAC address validation
 import socket # Added for DNS lookup
 import subprocess # Added for ffplay
 import base64 # Added for EPG decoding
+import threading # Added for Chromecast discovery
 from typing import Optional # Added for type hinting
 # import html # Not currently used
 from urllib.parse import urlparse, parse_qs
@@ -60,11 +61,37 @@ try:
         HAS_MULTIMEDIA = True
     except ImportError:
         HAS_MULTIMEDIA = False
+        QVideoWidget = QWidget # Fallback for class definition
         print("Warning: QtMultimedia not found. Embedded player will be disabled.")
 
 except ImportError:
     print("\nError: Required library 'PySide6' not found. Please install it: pip install PySide6", file=sys.stderr)
     sys.exit(1)
+
+# Attempt to import pychromecast (optional, for casting)
+HAS_CHROMECAST = False
+try:
+    import pychromecast
+    HAS_CHROMECAST = True
+except ImportError:
+    print("Warning: 'pychromecast' not found. Casting features will be disabled.")
+
+# --- Custom Widgets ---
+class ClickableVideoWidget(QVideoWidget):
+    """A VideoWidget that catches mouse events for double-click handling."""
+    doubleClicked = Signal()
+
+    def mouseDoubleClickEvent(self, event):
+        self.doubleClicked.emit()
+        super().mouseDoubleClickEvent(event)
+
+class ClickableLabel(QLabel):
+    """A QLabel that catches mouse events for double-click handling."""
+    doubleClicked = Signal()
+
+    def mouseDoubleClickEvent(self, event):
+        self.doubleClicked.emit()
+        super().mouseDoubleClickEvent(event)
 
 # --- Resource Path Helper for PyInstaller ---
 def resource_path(relative_path):
@@ -1288,6 +1315,12 @@ class PlaylistViewerDialog(QDialog):
         self.vod_streams = []
         self.series_streams = []
 
+        # Playback State
+        self.is_muted = False
+        self.cast_browser = None
+        self.cast_player = None
+        self.chromecasts = []
+
         layout = QVBoxLayout(self)
 
         self.tabs = QTabWidget()
@@ -1360,6 +1393,29 @@ class PlaylistViewerDialog(QDialog):
         # Use QSplitter for resizable panels
         main_layout = QVBoxLayout(tab_widget)
         main_layout.setContentsMargins(10, 10, 10, 10)
+
+        # --- Top Toolbar (Search & Controls) ---
+        toolbar_layout = QHBoxLayout()
+
+        # Search Bar
+        search_input = QLineEdit()
+        search_input.setPlaceholderText(f"Search {title}...")
+        search_input.textChanged.connect(lambda text, t=title: self.filter_channels_by_search(text, t))
+        toolbar_layout.addWidget(search_input)
+
+        # Mute Button
+        mute_btn = QPushButton("Mute")
+        mute_btn.setCheckable(True)
+        mute_btn.clicked.connect(self.toggle_mute)
+        toolbar_layout.addWidget(mute_btn)
+
+        # Chromecast Button
+        if HAS_CHROMECAST:
+            cast_btn = QPushButton("Cast to Device")
+            cast_btn.clicked.connect(self.cast_current_stream)
+            toolbar_layout.addWidget(cast_btn)
+
+        main_layout.addLayout(toolbar_layout)
 
         splitter = QSplitter(Qt.Horizontal)
         splitter.setHandleWidth(5)
@@ -1450,13 +1506,15 @@ class PlaylistViewerDialog(QDialog):
         # 2. Video Box
         video_widget = None
         if HAS_MULTIMEDIA:
-            video_widget = QVideoWidget()
+            video_widget = ClickableVideoWidget() # Use custom widget
             video_widget.setStyleSheet("background-color: black;")
+            video_widget.doubleClicked.connect(self.play_selected_external) # Connect signal
         else:
             # Placeholder if no multimedia
-            video_widget = QLabel("Video Player\n(QtMultimedia not available)")
+            video_widget = ClickableLabel("Video Player\n(QtMultimedia not available)")
             video_widget.setAlignment(Qt.AlignCenter)
             video_widget.setStyleSheet("background-color: black; color: white;")
+            video_widget.doubleClicked.connect(self.play_selected_external) # Connect signal
 
         right_splitter.addWidget(video_widget)
         right_splitter.setStretchFactor(0, 2) # EPG takes more space initially? Or 1:1
@@ -1557,6 +1615,101 @@ class PlaylistViewerDialog(QDialog):
             self.media_player.setVideoOutput(self.vod_video_widget)
         elif index == 2: # Series
             self.media_player.setVideoOutput(self.series_video_widget)
+
+    def toggle_mute(self):
+        self.is_muted = not self.is_muted
+        self.set_embedded_mute(self.is_muted)
+        state_text = "Muted" if self.is_muted else "Unmuted"
+        QMessageBox.information(self, "Mute", f"Audio is now {state_text}")
+
+    def set_embedded_mute(self, muted):
+        if HAS_MULTIMEDIA:
+            self.audio_output.setMuted(muted)
+
+    def cast_current_stream(self):
+        if not HAS_CHROMECAST:
+            QMessageBox.warning(self, "Error", "Chromecast support is not installed.")
+            return
+
+        # Get current stream
+        current_tab_idx = self.tabs.currentIndex()
+        table = None
+        if current_tab_idx == 0: table = self.live_table
+        elif current_tab_idx == 1: table = self.vod_table
+        elif current_tab_idx == 2: table = self.series_table
+
+        if not table: return
+
+        selected_items = table.selectedItems()
+        if not selected_items:
+            QMessageBox.information(self, "Cast", "Select a stream to cast first.")
+            return
+
+        row = selected_items[0].row()
+        stream_url = self.get_stream_url(table, row)
+        stream_name = table.item(row, 1).text()
+
+        if not stream_url: return
+
+        # Discover devices
+        services, browser = pychromecast.discovery.discover_chromecasts()
+        pychromecast.discovery.stop_discovery(browser)
+
+        if not services:
+            QMessageBox.warning(self, "Cast", "No Chromecast devices found.")
+            return
+
+        device_names = [s.friendly_name for s in services]
+        device_name, ok = QInputDialog.getItem(self, "Select Device", "Choose Chromecast:", device_names, 0, False)
+
+        if ok and device_name:
+            # Find the selected service
+            selected_uuid = None
+            for s in services:
+                if s.friendly_name == device_name:
+                    selected_uuid = s.uuid
+                    break
+
+            if selected_uuid:
+                cast = pychromecast.get_chromecast_from_cast_infos(services, [u for u in services if u.uuid == selected_uuid], zconf=browser.zc)
+                if cast:
+                    cast = cast[0] # Get the object
+                    cast.wait()
+                    mc = cast.media_controller
+                    mc.play_media(stream_url, 'video/mp4')
+                    mc.block_until_active()
+                    QMessageBox.information(self, "Casting", f"Casting '{stream_name}' to {device_name}")
+
+    def filter_channels_by_search(self, text, tab_title):
+        search_text = text.lower()
+        target_table = None
+        target_list = None # The source data list
+
+        if tab_title == "Live TV":
+            target_table = self.live_table
+            target_list = self.live_streams # Full list
+            cat_map = self.live_cat_map
+        elif tab_title == "VOD":
+            target_table = self.vod_table
+            target_list = self.vod_streams
+            cat_map = self.vod_cat_map
+        elif tab_title == "Series":
+            target_table = self.series_table
+            target_list = self.series_streams
+            cat_map = self.series_cat_map
+
+        if not target_table: return
+
+        # If search is empty, revert to category filter
+        if not search_text:
+             if tab_title == "Live TV": self.filter_live_streams()
+             elif tab_title == "VOD": self.filter_vod_streams()
+             elif tab_title == "Series": self.filter_series_streams()
+             return
+
+        # Perform Search Filter
+        filtered = [x for x in target_list if search_text in x.get('name', x.get('num', '')).lower()]
+        self.populate_table(target_table, filtered, cat_map)
 
     def populate_list(self, list_widget, categories):
         list_widget.clear()
@@ -1668,9 +1821,18 @@ class PlaylistViewerDialog(QDialog):
             return
 
         try:
+            # Mute embedded player before starting external one
+            self.is_muted = True
+            self.set_embedded_mute(True)
+
+            # Ensure SDL_WINDOWID is NOT set for external playback
+            env = os.environ.copy()
+            if 'SDL_WINDOWID' in env:
+                del env['SDL_WINDOWID']
+
             # Pass User-Agent to ffplay and open in separate window (default behavior)
             cmd = ['ffplay', '-user_agent', USER_AGENT, '-autoexit', '-window_title', f"Stream: {table.item(row, 1).text()}", stream_url]
-            subprocess.Popen(cmd)
+            subprocess.Popen(cmd, env=env)
         except FileNotFoundError:
             QMessageBox.critical(self, "Error", "ffplay not found. Please ensure FFmpeg is installed and in your system PATH.")
 
@@ -1693,8 +1855,8 @@ class PlaylistViewerDialog(QDialog):
         return f"{self.server_url.rstrip('/')}/{stream_type}/{self.username}/{self.password}/{stream_id}.{extension}"
 
     def play_stream_from_table_doubleclick(self, index):
-        table = self.sender()
-        self.play_stream_common(table, index.row())
+        # Double click on table just starts the preview immediately
+        self.start_preview_playback()
 
     def on_table_selection_changed(self, table):
         """Handle selection changes (mouse click or keyboard nav) to update EPG and embedded player."""
@@ -1784,41 +1946,6 @@ class PlaylistViewerDialog(QDialog):
                 logging.error(f"Failed to embed ffplay: {e}")
                 # Fallback? Maybe just log.
 
-    def play_selected_external(self):
-        # ... (Existing code for play_selected_external) ...
-        # Determine current tab
-        current_tab_idx = self.tabs.currentIndex()
-        table = None
-        if current_tab_idx == 0: table = self.live_table
-        elif current_tab_idx == 1: table = self.vod_table
-        elif current_tab_idx == 2: table = self.series_table
-
-        if not table: return
-
-        # Get selected row
-        selected_items = table.selectedItems()
-        if not selected_items:
-            QMessageBox.information(self, "Play Selected", "Please select a channel/stream first.")
-            return
-
-        row = selected_items[0].row()
-        stream_url = self.get_stream_url(table, row)
-
-        if not stream_url:
-            QMessageBox.information(self, "Info", "Could not determine stream URL.")
-            return
-
-        try:
-            # Ensure SDL_WINDOWID is NOT set for external playback
-            env = os.environ.copy()
-            if 'SDL_WINDOWID' in env:
-                del env['SDL_WINDOWID']
-
-            # Pass User-Agent to ffplay and open in separate window (default behavior)
-            cmd = ['ffplay', '-user_agent', USER_AGENT, '-autoexit', '-window_title', f"Stream: {table.item(row, 1).text()}", stream_url]
-            subprocess.Popen(cmd, env=env)
-        except FileNotFoundError:
-            QMessageBox.critical(self, "Error", "ffplay not found. Please ensure FFmpeg is installed and in your system PATH.")
 
     def load_epg_for_stream(self, stream_id):
         # Determine which list widget to use based on current tab
