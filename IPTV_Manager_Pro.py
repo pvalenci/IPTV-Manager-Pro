@@ -70,15 +70,15 @@ except ImportError:
 
 # Attempt to import pychromecast (optional, for casting)
 HAS_CHROMECAST = False
+CHROMECAST_IMPORT_ERROR = None
 try:
     import pychromecast
     HAS_CHROMECAST = True
-except ImportError:
+except ImportError as e:
     HAS_CHROMECAST = False
+    CHROMECAST_IMPORT_ERROR = str(e)
     # Log to both stdout (for console users) and logging (for file log)
-    print("Warning: 'pychromecast' not found. Casting features will be disabled.", file=sys.stderr)
-    # Note: Logging might not be configured yet if this is at module level,
-    # but it's safe to import. We'll rely on the runtime check in the button.
+    print(f"Warning: 'pychromecast' import failed. Casting features will be disabled. Error: {e}", file=sys.stderr)
 
 # --- Custom Widgets ---
 class ClickableVideoWidget(QVideoWidget):
@@ -1634,10 +1634,11 @@ class PlaylistViewerDialog(QDialog):
 
     def cast_current_stream(self):
         if not HAS_CHROMECAST:
+            error_details = f"\n\nError details: {CHROMECAST_IMPORT_ERROR}" if CHROMECAST_IMPORT_ERROR else ""
             QMessageBox.warning(self, "Missing Dependency",
-                                "The 'pychromecast' library is required for casting.\n\n"
-                                "Please install it by running:\n"
-                                "pip install pychromecast")
+                                "The 'pychromecast' library is required for casting but could not be imported.\n"
+                                "Please ensure it is installed (pip install pychromecast)."
+                                f"{error_details}")
             return
 
         # Get current stream
@@ -1661,33 +1662,45 @@ class PlaylistViewerDialog(QDialog):
         if not stream_url: return
 
         # Discover devices
-        services, browser = pychromecast.discovery.discover_chromecasts()
-        pychromecast.discovery.stop_discovery(browser)
+        self.live_status_label.setText("Searching for Chromecast devices...") # Use status label for feedback
+        QApplication.processEvents() # Force UI update
 
-        if not services:
-            QMessageBox.warning(self, "Cast", "No Chromecast devices found.")
-            return
+        try:
+            # Use get_chromecasts() which returns a list of Chromecast objects
+            # This handles discovery and object creation in one step
+            chromecasts, browser = pychromecast.get_chromecasts()
+            # browser.stop_discovery() # get_chromecasts manages discovery? Documentation varies, but let's be safe or rely on it.
+            # Note: get_chromecasts returns (casts, browser). We should probably stop discovery if we are done.
+            # But normally we might want to keep it if we expect dynamic updates.
+            # For this simple "click to cast", a one-shot is fine.
+            # pychromecast examples often don't explicitly stop browser if just using the list returned.
 
-        device_names = [s.friendly_name for s in services]
-        device_name, ok = QInputDialog.getItem(self, "Select Device", "Choose Chromecast:", device_names, 0, False)
+            if not chromecasts:
+                self.live_status_label.setText("No Chromecast devices found.")
+                QMessageBox.warning(self, "Cast", "No Chromecast devices found on the network.")
+                return
 
-        if ok and device_name:
-            # Find the selected service
-            selected_uuid = None
-            for s in services:
-                if s.friendly_name == device_name:
-                    selected_uuid = s.uuid
-                    break
+            device_map = {c.device.friendly_name: c for c in chromecasts}
+            device_names = list(device_map.keys())
 
-            if selected_uuid:
-                cast = pychromecast.get_chromecast_from_cast_infos(services, [u for u in services if u.uuid == selected_uuid], zconf=browser.zc)
-                if cast:
-                    cast = cast[0] # Get the object
-                    cast.wait()
-                    mc = cast.media_controller
-                    mc.play_media(stream_url, 'video/mp4')
-                    mc.block_until_active()
-                    QMessageBox.information(self, "Casting", f"Casting '{stream_name}' to {device_name}")
+            device_name, ok = QInputDialog.getItem(self, "Select Device", "Choose Chromecast:", device_names, 0, False)
+
+            if ok and device_name:
+                cast = device_map[device_name]
+                cast.wait()
+                mc = cast.media_controller
+                mc.play_media(stream_url, 'video/mp4', title=stream_name)
+                mc.block_until_active()
+
+                self.live_status_label.setText(f"Casting to {device_name}...")
+                QMessageBox.information(self, "Casting", f"Casting '{stream_name}' to {device_name}")
+            else:
+                self.live_status_label.setText("Casting cancelled.")
+
+        except Exception as e:
+            logging.error(f"Chromecast Error: {e}")
+            QMessageBox.critical(self, "Cast Error", f"An error occurred while trying to cast:\n{e}")
+            self.live_status_label.setText("Error during casting.")
 
     def filter_channels_by_search(self, text, tab_title):
         search_text = text.lower()
@@ -1943,7 +1956,7 @@ class PlaylistViewerDialog(QDialog):
                     '-user_agent', USER_AGENT,
                     '-noborder',
                     '-infbuf', # Low latency
-                    '-loglevel', 'quiet',
+                    '-loglevel', 'warning', # Changed from quiet to warning for debugging
                     '-x', str(video_widget.width()), # Hint size
                     '-y', str(video_widget.height()),
                     stream_url
@@ -1981,6 +1994,7 @@ class PlaylistViewerDialog(QDialog):
             current_ts = time.time() # UTC timestamp roughly
             # Adjust if needed. XC usually returns server time text but UTC timestamps.
             # We will use timestamps for logic.
+            logging.debug(f"EPG Highlight Check: Current System TS={current_ts}")
 
             found_current = False
 
@@ -2022,7 +2036,13 @@ class PlaylistViewerDialog(QDialog):
                 # Highlight Current Program
                 # Logic: start_ts <= current_ts < stop_ts
                 # Note: XC timestamps are usually correct UTC.
-                if start_ts <= current_ts < stop_ts:
+                is_current = start_ts <= current_ts < stop_ts
+
+                # Debug logging for the first few items or if match found
+                if is_current:
+                    logging.debug(f"EPG Match Found: {title} ({start_ts} <= {current_ts} < {stop_ts})")
+
+                if is_current:
                     # Green/Blue highlighting
                     # Use a color that works for light/dark themes or hardcode a safe pastel
                     item.setBackground(QColor("#e6f7ff")) # Light Blue
