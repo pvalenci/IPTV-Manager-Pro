@@ -76,9 +76,12 @@ try:
     HAS_CHROMECAST = True
 except ImportError as e:
     HAS_CHROMECAST = False
-    CHROMECAST_IMPORT_ERROR = str(e)
+    import pprint
+    debug_paths = pprint.pformat(sys.path)
+    CHROMECAST_IMPORT_ERROR = f"{e}\n\nPython Executable: {sys.executable}\n\nSys Path: {debug_paths}"
     # Log to both stdout (for console users) and logging (for file log)
     print(f"Warning: 'pychromecast' import failed. Casting features will be disabled. Error: {e}", file=sys.stderr)
+    print(f"Debug Info:\nExe: {sys.executable}\nPath: {sys.path}", file=sys.stderr)
 
 # --- Custom Widgets ---
 class ClickableVideoWidget(QVideoWidget):
