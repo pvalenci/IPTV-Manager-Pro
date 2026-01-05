@@ -1683,7 +1683,7 @@ class PlaylistViewerDialog(QDialog):
                 QMessageBox.warning(self, "Cast", "No Chromecast devices found on the network.")
                 return
 
-            device_map = {c.device.friendly_name: c for c in chromecasts}
+            device_map = {c.name: c for c in chromecasts}
             device_names = list(device_map.keys())
 
             device_name, ok = QInputDialog.getItem(self, "Select Device", "Choose Chromecast:", device_names, 0, False)
