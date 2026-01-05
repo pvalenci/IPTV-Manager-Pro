@@ -15,6 +15,10 @@ import logging
 import time
 import csv
 import re # Added for MAC address validation
+import socket # Added for DNS lookup
+import subprocess # Added for ffplay
+import base64 # Added for EPG decoding
+import threading # Added for Chromecast discovery
 from typing import Optional # Added for type hinting
 # import html # Not currently used
 from urllib.parse import urlparse, parse_qs
@@ -40,16 +44,61 @@ try:
         QFormLayout, QMessageBox, QDialogButtonBox, QLabel,
         QListWidget, QListWidgetItem, QInputDialog, QMenu,
         QAbstractItemView, QHeaderView, QStatusBar, QProgressBar,
-        QFileDialog
+        QFileDialog, QTabWidget, QTableWidget, QTableWidgetItem, QStyle, QToolButton,
+        QSplitter
     )
-    from PySide6.QtGui import QStandardItemModel, QStandardItem, QColor, QAction, QIcon, QKeySequence, QGuiApplication
+    from PySide6.QtGui import QStandardItemModel, QStandardItem, QColor, QAction, QIcon, QKeySequence, QGuiApplication, QDesktopServices, QPalette
     from PySide6.QtCore import (
         Qt, Slot, Signal, QObject, QThread, QModelIndex, QSortFilterProxyModel,
-        QDateTime, QTimer
+        QDateTime, QTimer, QUrl, QSize
     )
+
+    # Attempt to import QtMultimedia (optional, for embedded player)
+    HAS_MULTIMEDIA = False
+    try:
+        from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
+        from PySide6.QtMultimediaWidgets import QVideoWidget
+        HAS_MULTIMEDIA = True
+    except ImportError:
+        HAS_MULTIMEDIA = False
+        QVideoWidget = QWidget # Fallback for class definition
+        print("Warning: QtMultimedia not found. Embedded player will be disabled.")
+
 except ImportError:
     print("\nError: Required library 'PySide6' not found. Please install it: pip install PySide6", file=sys.stderr)
     sys.exit(1)
+
+# Attempt to import pychromecast (optional, for casting)
+HAS_CHROMECAST = False
+CHROMECAST_IMPORT_ERROR = None
+try:
+    import pychromecast
+    HAS_CHROMECAST = True
+except ImportError as e:
+    HAS_CHROMECAST = False
+    import pprint
+    debug_paths = pprint.pformat(sys.path)
+    CHROMECAST_IMPORT_ERROR = f"{e}\n\nPython Executable: {sys.executable}\n\nSys Path: {debug_paths}"
+    # Log to both stdout (for console users) and logging (for file log)
+    print(f"Warning: 'pychromecast' import failed. Casting features will be disabled. Error: {e}", file=sys.stderr)
+    print(f"Debug Info:\nExe: {sys.executable}\nPath: {sys.path}", file=sys.stderr)
+
+# --- Custom Widgets ---
+class ClickableVideoWidget(QVideoWidget):
+    """A VideoWidget that catches mouse events for double-click handling."""
+    doubleClicked = Signal()
+
+    def mouseDoubleClickEvent(self, event):
+        self.doubleClicked.emit()
+        super().mouseDoubleClickEvent(event)
+
+class ClickableLabel(QLabel):
+    """A QLabel that catches mouse events for double-click handling."""
+    doubleClicked = Signal()
+
+    def mouseDoubleClickEvent(self, event):
+        self.doubleClicked.emit()
+        super().mouseDoubleClickEvent(event)
 
 # --- Resource Path Helper for PyInstaller ---
 def resource_path(relative_path):
@@ -58,7 +107,7 @@ def resource_path(relative_path):
         # PyInstaller creates a temp folder and stores path in _MEIPASS
         base_path = sys._MEIPASS
     except Exception:
-        base_path = os.path.abspath(".")
+        base_path = os.path.dirname(os.path.abspath(__file__))
 
     return os.path.join(base_path, relative_path)
 
@@ -165,6 +214,21 @@ def initialize_database():
         except sqlite3.OperationalError:
             logging.info("Adding 'series_count' column to entries table.")
             cursor.execute("ALTER TABLE entries ADD COLUMN series_count INTEGER")
+        try:
+            cursor.execute("SELECT comments FROM entries LIMIT 1")
+        except sqlite3.OperationalError:
+            logging.info("Adding 'comments' column to entries table.")
+            cursor.execute("ALTER TABLE entries ADD COLUMN comments TEXT")
+        try:
+            cursor.execute("SELECT server_ip FROM entries LIMIT 1")
+        except sqlite3.OperationalError:
+            logging.info("Adding 'server_ip' column to entries table.")
+            cursor.execute("ALTER TABLE entries ADD COLUMN server_ip TEXT")
+        try:
+            cursor.execute("SELECT service FROM entries LIMIT 1")
+        except sqlite3.OperationalError:
+            logging.info("Adding 'service' column to entries table.")
+            cursor.execute("ALTER TABLE entries ADD COLUMN service TEXT")
 
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS categories (
@@ -183,28 +247,28 @@ def initialize_database():
     finally:
         if conn: conn.close()
 
-def add_entry(name, category, server_url, username, password, account_type='xc', mac_address=None, portal_url=None):
+def add_entry(name, category, server_url, username, password, account_type='xc', mac_address=None, portal_url=None, comments=None, service=None):
     conn = get_db_connection()
     try:
         cursor = conn.execute('''
-            INSERT INTO entries (name, category, server_base_url, username, password, account_type, mac_address, portal_url)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (name, category, server_url, username, password, account_type, mac_address, portal_url))
+            INSERT INTO entries (name, category, server_base_url, username, password, account_type, mac_address, portal_url, comments, service)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (name, category, server_url, username, password, account_type, mac_address, portal_url, comments, service))
         conn.commit()
         entry_id = cursor.lastrowid
         logging.info(f"Added entry: {name} (ID: {entry_id}, Type: {account_type})")
         return entry_id
     finally: conn.close()
 
-def update_entry(entry_id, name, category, server_url, username, password, account_type='xc', mac_address=None, portal_url=None):
+def update_entry(entry_id, name, category, server_url, username, password, account_type='xc', mac_address=None, portal_url=None, comments=None, service=None):
     conn = get_db_connection()
     try:
         conn.execute('''
             UPDATE entries
             SET name = ?, category = ?, server_base_url = ?, username = ?, password = ?,
-                account_type = ?, mac_address = ?, portal_url = ?
+                account_type = ?, mac_address = ?, portal_url = ?, comments = ?, service = ?
             WHERE id = ?
-        ''', (name, category, server_url, username, password, account_type, mac_address, portal_url, entry_id))
+        ''', (name, category, server_url, username, password, account_type, mac_address, portal_url, comments, service, entry_id))
         conn.commit()
         logging.info(f"Updated entry ID: {entry_id} (Type: {account_type})")
     finally: conn.close()
@@ -255,7 +319,8 @@ def update_entry_status(entry_id, status_data):
             SET last_checked_at = ?, api_status = ?, api_message = ?,
                 expiry_date_ts = ?, is_trial = ?, active_connections = ?,
                 max_connections = ?, raw_user_info = ?, raw_server_info = ?,
-                live_streams_count = ?, movies_count = ?, series_count = ?
+                live_streams_count = ?, movies_count = ?, series_count = ?,
+                server_ip = ?
             WHERE id = ?
         ''', (
             current_time_iso, status_data.get('api_status'), status_data.get('api_message'),
@@ -263,12 +328,30 @@ def update_entry_status(entry_id, status_data):
             status_data.get('active_connections'), status_data.get('max_connections'),
             status_data.get('raw_user_info'), status_data.get('raw_server_info'),
             status_data.get('live_streams_count'), status_data.get('movies_count'),
-            status_data.get('series_count'), entry_id
+            status_data.get('series_count'), status_data.get('server_ip'), entry_id
         ))
         conn.commit()
         logging.info(f"Updated status for entry ID: {entry_id} to {status_data.get('api_status')}")
     except Exception as e: logging.error(f"Failed to update status for entry ID {entry_id}: {e}")
     finally: conn.close()
+
+def update_entry_comment(entry_id, new_comment):
+    conn = get_db_connection()
+    try:
+        conn.execute("UPDATE entries SET comments = ? WHERE id = ?", (new_comment, entry_id))
+        conn.commit()
+        logging.info(f"Updated comment for entry ID: {entry_id}")
+    finally:
+        conn.close()
+
+def update_entry_service(entry_id, new_service):
+    conn = get_db_connection()
+    try:
+        conn.execute("UPDATE entries SET service = ? WHERE id = ?", (new_service, entry_id))
+        conn.commit()
+        logging.info(f"Updated service for entry ID: {entry_id}")
+    finally:
+        conn.close()
 
 def get_all_categories():
     conn = get_db_connection()
@@ -341,6 +424,35 @@ def parse_get_php_url(url_string):
 # API UTILITIES
 # =============================================================================
 API_HEADERS = {'User-Agent': USER_AGENT}
+
+def decode_base64_text(text):
+    """
+    Attempts to decode Base64 text. Returns original text if decoding fails.
+    Used for Xtream Codes EPG data which is often Base64 encoded.
+    """
+    if not text:
+        return ""
+    try:
+        # Check if it looks like base64
+        # (This is a heuristic; XC usually encodes everything or nothing)
+        decoded_bytes = base64.b64decode(text, validate=True)
+        return decoded_bytes.decode('utf-8', 'ignore')
+    except Exception:
+        return text
+
+def resolve_dns_ip(url_string):
+    """Resolves the IP address of the hostname in the given URL."""
+    try:
+        parsed_url = urlparse(url_string)
+        hostname = parsed_url.hostname
+        if hostname:
+            ip_address = socket.gethostbyname(hostname)
+            logging.info(f"Resolved IP for {hostname}: {ip_address}")
+            return ip_address
+    except Exception as e:
+        logging.warning(f"DNS resolution failed for {url_string}: {e}")
+    return "Lookup Failed"
+
 def get_safe_api_value(data_dict, key, default=None):
     if not isinstance(data_dict, dict): return default
     value = data_dict.get(key); return default if value == "" else value
@@ -349,7 +461,7 @@ def format_timestamp_display(unix_timestamp_utc):
     if unix_timestamp_utc is None or not isinstance(unix_timestamp_utc, (int, float)) or unix_timestamp_utc <= 0: return "N/A"
     try:
         dt_utc = datetime.fromtimestamp(int(unix_timestamp_utc), tz=timezone.utc); dt_local = dt_utc.astimezone(DISPLAY_TZ)
-        return dt_local.strftime('%Y-%m-%d %H:%M %Z')
+        return dt_local.strftime('%y-%m-%d')
     except: return "Invalid"
 
 def format_trial_status_display(is_trial):
@@ -371,12 +483,97 @@ def get_stream_counts(server_base_url, username, password, session):
             logging.warning(f"Could not fetch {cat_type} streams: {e}")
     return counts
 
+def get_live_streams_all(server_base_url, username, password, session=None):
+    if not session: session = requests.Session()
+    api_url = f"{server_base_url.rstrip('/')}/player_api.php?username={username}&password={password}&action=get_live_streams"
+    try:
+        response = session.get(api_url, timeout=10, headers=API_HEADERS)
+        response.raise_for_status()
+        return response.json()
+    except Exception as e:
+        logging.error(f"Error fetching live streams: {e}")
+        return []
+
+def get_vod_streams_all(server_base_url, username, password, session=None):
+    if not session: session = requests.Session()
+    api_url = f"{server_base_url.rstrip('/')}/player_api.php?username={username}&password={password}&action=get_vod_streams"
+    try:
+        response = session.get(api_url, timeout=10, headers=API_HEADERS)
+        response.raise_for_status()
+        return response.json()
+    except Exception as e:
+        logging.error(f"Error fetching VOD streams: {e}")
+        return []
+
+def get_series_all(server_base_url, username, password, session=None):
+    if not session: session = requests.Session()
+    api_url = f"{server_base_url.rstrip('/')}/player_api.php?username={username}&password={password}&action=get_series"
+    try:
+        response = session.get(api_url, timeout=10, headers=API_HEADERS)
+        response.raise_for_status()
+        return response.json()
+    except Exception as e:
+        logging.error(f"Error fetching series: {e}")
+        return []
+
+def get_live_categories(server_base_url, username, password, session=None):
+    if not session: session = requests.Session()
+    api_url = f"{server_base_url.rstrip('/')}/player_api.php?username={username}&password={password}&action=get_live_categories"
+    try:
+        response = session.get(api_url, timeout=10, headers=API_HEADERS)
+        response.raise_for_status()
+        return response.json()
+    except Exception as e:
+        logging.error(f"Error fetching live categories: {e}")
+        return []
+
+def get_vod_categories(server_base_url, username, password, session=None):
+    if not session: session = requests.Session()
+    api_url = f"{server_base_url.rstrip('/')}/player_api.php?username={username}&password={password}&action=get_vod_categories"
+    try:
+        response = session.get(api_url, timeout=10, headers=API_HEADERS)
+        response.raise_for_status()
+        return response.json()
+    except Exception as e:
+        logging.error(f"Error fetching VOD categories: {e}")
+        return []
+
+def get_series_categories(server_base_url, username, password, session=None):
+    if not session: session = requests.Session()
+    api_url = f"{server_base_url.rstrip('/')}/player_api.php?username={username}&password={password}&action=get_series_categories"
+    try:
+        response = session.get(api_url, timeout=10, headers=API_HEADERS)
+        response.raise_for_status()
+        return response.json()
+    except Exception as e:
+        logging.error(f"Error fetching series categories: {e}")
+        return []
+
+def get_epg_for_stream(server_base_url, username, password, stream_id, session=None):
+    """Fetches EPG using get_simple_data_table action (Full EPG)."""
+    if not session: session = requests.Session()
+    api_url = f"{server_base_url.rstrip('/')}/player_api.php?username={username}&password={password}&action=get_simple_data_table&stream_id={stream_id}"
+    try:
+        response = session.get(api_url, timeout=10, headers=API_HEADERS)
+        response.raise_for_status()
+        data = response.json()
+        # Handle different EPG response formats (get_simple_data_table usually returns object with epg_listings)
+        if isinstance(data, dict) and "epg_listings" in data:
+            return data["epg_listings"]
+        elif isinstance(data, list):
+            return data
+        return []
+    except Exception as e:
+        logging.error(f"Error fetching EPG for stream {stream_id}: {e}")
+        return []
+
 def check_account_status_detailed_api(server_base_url, username, password, session):
     processed_data = {
         'success': False, 'api_status': None, 'api_message': "Check init error",
         'expiry_date_ts': None, 'is_trial': None, 'active_connections': None,
         'max_connections': None, 'raw_user_info': None, 'raw_server_info': None,
-        'live_streams_count': None, 'movies_count': None, 'series_count': None
+        'live_streams_count': None, 'movies_count': None, 'series_count': None,
+        'server_ip': None
     }
     # Session should be initialized before this is called in a loop.
     if not all([server_base_url, username is not None, session]):
@@ -388,6 +585,10 @@ def check_account_status_detailed_api(server_base_url, username, password, sessi
         if not parsed_base.scheme or not parsed_base.netloc:
             raise ValueError("Invalid server_base_url format")
         api_url = f"{server_base_url.rstrip('/')}/player_api.php?username={username}&password={password}&action=get_user_info"
+
+        # Resolve DNS
+        processed_data['server_ip'] = resolve_dns_ip(server_base_url)
+
     except Exception as url_e:
         processed_data['api_message'] = f"Invalid Server URL: {url_e}"
         return processed_data
@@ -541,7 +742,8 @@ def check_stalker_portal_status(portal_url: str, mac_address: str, session: requ
     processed_data = {
         'success': False, 'api_status': "Error", 'api_message': "Check init error (Stalker)",
         'expiry_date_ts': None, 'is_trial': None, 'active_connections': None, # Stalker might not provide these
-        'max_connections': None, 'raw_user_info': None, 'raw_server_info': None # server_info not typical for Stalker
+        'max_connections': None, 'raw_user_info': None, 'raw_server_info': None, # server_info not typical for Stalker
+        'server_ip': None
     }
 
     if not all([portal_url, mac_address, session]):
@@ -551,6 +753,9 @@ def check_stalker_portal_status(portal_url: str, mac_address: str, session: requ
     # Ensure MAC address is in the common format for headers/cookies if needed
     formatted_mac = mac_address.upper() # For Authorization header
     # cookie_mac = mac_address.replace(":", "").lower() # Example for cookie, if portal expects it specifically
+
+    # Resolve DNS
+    processed_data['server_ip'] = resolve_dns_ip(portal_url)
 
     token = _get_stalker_token(session, portal_url, formatted_mac)
 
@@ -718,6 +923,9 @@ class EntryDialog(QDialog):
         self.category_combo = QComboBox()
         self.populate_categories()
 
+        self.comments_edit = QLineEdit()
+        self.service_edit = QLineEdit()
+
         self.account_type_combo = QComboBox()
         self.account_type_combo.addItems(["Xtream Codes API", "Stalker Portal"])
         self.account_type_combo.currentTextChanged.connect(self.toggle_input_fields)
@@ -729,7 +937,7 @@ class EntryDialog(QDialog):
         self.username_edit = QLineEdit()
         self.password_label = QLabel("Password:")
         self.password_edit = QLineEdit()
-        self.password_edit.setEchoMode(QLineEdit.Password)
+        # self.password_edit.setEchoMode(QLineEdit.Password) # Password unmasked per request
 
         # Stalker Portal Fields
         self.portal_url_label = QLabel("Portal URL (e.g., http://domain:port/c/):")
@@ -739,6 +947,8 @@ class EntryDialog(QDialog):
 
         form_layout.addRow("Display Name:", self.name_edit)
         form_layout.addRow("Category:", self.category_combo)
+        form_layout.addRow("Comments:", self.comments_edit)
+        form_layout.addRow("Service:", self.service_edit)
         form_layout.addRow("Account Type:", self.account_type_combo)
 
         # Add XC fields (will be shown/hidden)
@@ -790,6 +1000,10 @@ class EntryDialog(QDialog):
             entry = get_entry_by_id(self.entry_id)
             if entry:
                 self.name_edit.setText(entry['name'])
+                if 'comments' in entry.keys():
+                    self.comments_edit.setText(entry['comments'] or "")
+                if 'service' in entry.keys():
+                    self.service_edit.setText(entry['service'] or "")
                 # entry is an sqlite3.Row object.
                 current_account_type = entry['account_type'] if entry['account_type'] is not None else 'xc'
                 type_display_name = "Stalker Portal" if current_account_type == 'stalker' else "Xtream Codes API"
@@ -821,6 +1035,8 @@ class EntryDialog(QDialog):
         data = {
             "name": self.name_edit.text().strip(),
             "category": self.category_combo.currentText(),
+            "comments": self.comments_edit.text().strip(),
+            "service": self.service_edit.text().strip(),
             "account_type_text": self.account_type_combo.currentText()
         }
         if data["account_type_text"] == "Stalker Portal":
@@ -876,11 +1092,11 @@ class EntryDialog(QDialog):
             if self.is_edit_mode:
                 update_entry(self.entry_id, data['name'], data['category'],
                              data['server_url'], data['username'], data['password'],
-                             data['account_type'], data['mac_address'], data['portal_url'])
+                             data['account_type'], data['mac_address'], data['portal_url'], data['comments'], data['service'])
             else:
                 add_entry(data['name'], data['category'],
                           data['server_url'], data['username'], data['password'],
-                          data['account_type'], data['mac_address'], data['portal_url'])
+                          data['account_type'], data['mac_address'], data['portal_url'], data['comments'], data['service'])
             self.accept()
         except Exception as e: logging.error(f"Error saving entry: {e}"); QMessageBox.critical(self, "Database Error", f"Could not save: {e}")
 
@@ -1042,10 +1258,856 @@ class BulkEditCategoryDialog(QDialog):
     def get_selected_category(self):
         return self.category_combo.currentText()
 
+class BulkEditCommentsDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Bulk Edit Comments")
+        self.setMinimumWidth(400)
+        self.setWindowModality(Qt.WindowModal)
+
+        layout = QVBoxLayout(self)
+        form_layout = QFormLayout()
+
+        self.comment_edit = QLineEdit()
+        self.comment_edit.setPlaceholderText("Enter new comment for selected entries")
+
+        form_layout.addRow("New Comment:", self.comment_edit)
+        layout.addLayout(form_layout)
+
+        self.button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        self.button_box.accepted.connect(self.accept)
+        self.button_box.rejected.connect(self.reject)
+        layout.addWidget(self.button_box)
+
+    def get_comment(self):
+        return self.comment_edit.text()
+
+class BulkEditServiceDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Bulk Edit Service")
+        self.setMinimumWidth(400)
+        self.setWindowModality(Qt.WindowModal)
+
+        layout = QVBoxLayout(self)
+        form_layout = QFormLayout()
+
+        self.service_edit = QLineEdit()
+        self.service_edit.setPlaceholderText("Enter new service for selected entries")
+
+        form_layout.addRow("New Service:", self.service_edit)
+        layout.addLayout(form_layout)
+
+        self.button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        self.button_box.accepted.connect(self.accept)
+        self.button_box.rejected.connect(self.reject)
+        layout.addWidget(self.button_box)
+
+    def get_service(self):
+        return self.service_edit.text()
+
+class PlaylistViewerDialog(QDialog):
+    def __init__(self, server_url, username, password, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"Playlist Viewer - {server_url}")
+        self.resize(1200, 800)
+        self.setWindowState(Qt.WindowMaximized)
+        self.setWindowFlags(self.windowFlags() | Qt.WindowMinimizeButtonHint | Qt.WindowMaximizeButtonHint | Qt.WindowCloseButtonHint)
+        self.server_url = server_url
+        self.username = username
+        self.password = password
+
+        # Data storage
+        self.live_streams = []
+        self.vod_streams = []
+        self.series_streams = []
+
+        # Playback State
+        self.is_muted = False
+        self.cast_browser = None
+        self.cast_player = None
+        self.chromecasts = []
+
+        layout = QVBoxLayout(self)
+
+        self.tabs = QTabWidget()
+        layout.addWidget(self.tabs)
+
+        self.live_tab = QWidget()
+        self.vod_tab = QWidget()
+        self.series_tab = QWidget()
+
+        self.setup_tab(self.live_tab, "Live TV")
+        self.setup_tab(self.vod_tab, "VOD")
+        self.setup_tab(self.series_tab, "Series")
+
+        self.tabs.addTab(self.live_tab, "Live TV")
+        self.tabs.addTab(self.vod_tab, "VOD")
+        self.tabs.addTab(self.series_tab, "Series")
+
+        # Open Source Button
+        btn_layout = QHBoxLayout()
+        self.play_selected_external_btn = QPushButton("Play Selected in New Window")
+        self.play_selected_external_btn.clicked.connect(self.play_selected_external)
+        btn_layout.addStretch()
+        btn_layout.addWidget(self.play_selected_external_btn)
+        layout.addLayout(btn_layout)
+
+        # Preview Debounce Timer
+        self.preview_timer = QTimer()
+        self.preview_timer.setSingleShot(True)
+        self.preview_timer.setInterval(500) # 500ms delay
+        self.preview_timer.timeout.connect(self.start_preview_playback)
+        self.ffplay_process = None
+
+        # Load data thread
+        self.load_worker = PlaylistLoaderWorker(self.server_url, self.username, self.password)
+        self.load_thread = QThread()
+        self.load_worker.moveToThread(self.load_thread)
+
+        self.load_thread.started.connect(self.load_worker.load_all)
+        self.load_worker.data_ready.connect(self.on_data_loaded)
+        self.load_worker.error_occurred.connect(self.on_load_error)
+        self.load_worker.finished.connect(self.load_thread.quit)
+        self.load_worker.finished.connect(self.load_worker.deleteLater)
+        self.load_thread.finished.connect(self.load_thread.deleteLater)
+
+        self.live_status_label.setText("Loading playlist data... Please wait.")
+        self.vod_status_label.setText("Loading playlist data... Please wait.")
+        self.series_status_label.setText("Loading playlist data... Please wait.")
+
+        self.load_thread.start()
+
+    def closeEvent(self, event):
+        self.cleanup_ffplay()
+        super().closeEvent(event)
+
+    def cleanup_ffplay(self):
+        if self.ffplay_process:
+            try:
+                self.ffplay_process.terminate()
+                self.ffplay_process.wait(timeout=1)
+            except Exception:
+                pass
+            if self.ffplay_process and self.ffplay_process.poll() is None:
+                try:
+                    self.ffplay_process.kill()
+                except Exception:
+                    pass
+            self.ffplay_process = None
+
+    def setup_tab(self, tab_widget, title):
+        # Use QSplitter for resizable panels
+        main_layout = QVBoxLayout(tab_widget)
+        main_layout.setContentsMargins(10, 10, 10, 10)
+
+        # --- Top Toolbar (Search & Controls) ---
+        toolbar_layout = QHBoxLayout()
+
+        # Search Bar
+        search_input = QLineEdit()
+        search_input.setPlaceholderText(f"Search {title}...")
+        search_input.textChanged.connect(lambda text, t=title: self.filter_channels_by_search(text, t))
+        toolbar_layout.addWidget(search_input)
+
+        # Mute Button
+        mute_btn = QPushButton("Mute")
+        mute_btn.setCheckable(True)
+        mute_btn.clicked.connect(self.toggle_mute)
+        toolbar_layout.addWidget(mute_btn)
+
+        # Chromecast Button
+        cast_btn = QPushButton("Cast to Device")
+        cast_btn.clicked.connect(self.cast_current_stream)
+        if not HAS_CHROMECAST:
+            cast_btn.setToolTip("Install 'pychromecast' to enable this feature.")
+            # We keep it enabled so they can click and get the instruction message
+        toolbar_layout.addWidget(cast_btn)
+
+        main_layout.addLayout(toolbar_layout)
+
+        splitter = QSplitter(Qt.Horizontal)
+        splitter.setHandleWidth(5)
+
+        # --- Left Panel: Groups (QListWidget) ---
+        list_widget = QListWidget()
+        list_widget.setUniformItemSizes(True) # Optimization and helps with fixed height
+        list_widget.setStyleSheet("""
+            QListWidget {
+                background-color: #f9f9f9;
+                border: 1px solid #ddd;
+                font-size: 12px;
+                color: #333;
+            }
+            QListWidget::item {
+                height: 24px; /* Force height to match channel table rows (24px) */
+                padding: 0px 5px; /* Adjust padding to center text vertically */
+                border-bottom: 1px solid #eee;
+            }
+            QListWidget::item:selected {
+                background-color: #e6f7ff;
+                color: #000;
+                border-left: none;
+                border-right: 4px solid #1890ff; /* Moved to right side per request */
+            }
+        """)
+        splitter.addWidget(list_widget)
+
+        # --- Center Panel: Channels (QTableWidget) ---
+        table = QTableWidget()
+        table.setColumnCount(4)
+        table.setHorizontalHeaderLabels(["Group", "Channel Name", "Actions", "StreamID"])
+
+        # Adjust Column Modes for better visibility
+        header = table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeToContents) # Group
+        header.setSectionResizeMode(1, QHeaderView.Stretch) # Name gets most space
+        header.setSectionResizeMode(2, QHeaderView.ResizeToContents) # Actions (Button)
+
+        table.setColumnHidden(0, True) # Hide Group column (redundant with left panel)
+        table.setColumnHidden(3, True) # Hide StreamID
+        table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        table.setAlternatingRowColors(True)
+        table.verticalHeader().setVisible(False)
+        table.verticalHeader().setDefaultSectionSize(24)
+        table.setStyleSheet("""
+            QTableWidget {
+                background-color: white;
+                gridline-color: #eee;
+                border: 1px solid #ddd;
+            }
+            QTableWidget::item {
+                padding: 2px;
+            }
+            QHeaderView::section {
+                background-color: #f2f2f2;
+                padding: 4px;
+                border: 1px solid #ddd;
+                font-weight: bold;
+            }
+        """)
+        table.doubleClicked.connect(self.play_stream_from_table_doubleclick)
+        # Connect selection change to playback for keyboard navigation support
+        table.itemSelectionChanged.connect(lambda: self.on_table_selection_changed(table))
+        splitter.addWidget(table)
+
+        # --- Right Panel: EPG List + Video Box ---
+        # Use a Vertical Splitter for EPG (top) and Video (bottom)
+        right_splitter = QSplitter(Qt.Vertical)
+
+        # 1. EPG List
+        epg_list = QListWidget()
+        epg_list.setStyleSheet("""
+            QListWidget {
+                background-color: #f9f9f9;
+                border: 1px solid #ddd;
+                font-size: 12px;
+                color: #333;
+            }
+            QListWidget::item {
+                padding: 5px;
+                border-bottom: 1px solid #eee;
+            }
+        """)
+        right_splitter.addWidget(epg_list)
+
+        # 2. Video Box
+        video_widget = None
+        if HAS_MULTIMEDIA:
+            video_widget = ClickableVideoWidget() # Use custom widget
+            video_widget.setStyleSheet("background-color: black;")
+            video_widget.doubleClicked.connect(self.play_selected_external) # Connect signal
+        else:
+            # Placeholder if no multimedia
+            video_widget = ClickableLabel("Video Player\n(QtMultimedia not available)")
+            video_widget.setAlignment(Qt.AlignCenter)
+            video_widget.setStyleSheet("background-color: black; color: white;")
+            video_widget.doubleClicked.connect(self.play_selected_external) # Connect signal
+
+        right_splitter.addWidget(video_widget)
+        right_splitter.setStretchFactor(0, 2) # EPG takes more space initially? Or 1:1
+        right_splitter.setStretchFactor(1, 1)
+
+        splitter.addWidget(right_splitter)
+
+        # Store references
+        if title == "Live TV":
+            self.live_epg_list = epg_list
+            self.live_video_widget = video_widget
+        elif title == "VOD":
+            self.vod_epg_list = epg_list
+            self.vod_video_widget = video_widget
+        elif title == "Series":
+            self.series_epg_list = epg_list
+            self.series_video_widget = video_widget
+
+        # Set initial stretch factors (index, stretch)
+        splitter.setStretchFactor(0, 1) # List
+        splitter.setStretchFactor(1, 2) # Table
+        splitter.setStretchFactor(2, 2) # Video/EPG Column
+
+        # Set initial sizes explicitly to avoid cramped look if stretch doesn't kick in immediately
+        splitter.setSizes([250, 450, 500])
+
+        main_layout.addWidget(splitter, 1) # Add with stretch factor 1 to take available space
+
+        # Status Label (Highlighted functionality)
+        status_label = QLabel("Loaded 0 items.")
+        status_label.setStyleSheet("color: gray; padding: 5px;")
+        main_layout.addWidget(status_label, 0) # Add with stretch factor 0 to take minimum space
+
+        # Store references (updated for ListWidget)
+        if title == "Live TV":
+            self.live_table = table
+            self.live_status_label = status_label
+            self.live_group_list = list_widget
+            self.live_group_list.currentItemChanged.connect(self.filter_live_streams)
+        elif title == "VOD":
+            self.vod_table = table
+            self.vod_status_label = status_label
+            self.vod_group_list = list_widget
+            self.vod_group_list.currentItemChanged.connect(self.filter_vod_streams)
+        elif title == "Series":
+            self.series_table = table
+            self.series_status_label = status_label
+            self.series_group_list = list_widget
+            self.series_group_list.currentItemChanged.connect(self.filter_series_streams)
+
+    @Slot(dict)
+    def on_data_loaded(self, data):
+        # Unpack data
+        live_cats = data['live_cats']
+        vod_cats = data['vod_cats']
+        series_cats = data['series_cats']
+        self.live_streams = data['live_streams']
+        self.vod_streams = data['vod_streams']
+        self.series_streams = data['series_streams']
+
+        self.populate_list(self.live_group_list, live_cats)
+        self.populate_list(self.vod_group_list, vod_cats)
+        self.populate_list(self.series_group_list, series_cats)
+
+        # Map categories for quick lookup (ID -> Name)
+        self.live_cat_map = {str(c.get('category_id')): c.get('category_name') for c in live_cats}
+        self.vod_cat_map = {str(c.get('category_id')): c.get('category_name') for c in vod_cats}
+        self.series_cat_map = {str(c.get('category_id')): c.get('category_name') for c in series_cats}
+
+        # Initial Populate
+        # Select first item to trigger filter
+        if self.live_group_list.count() > 0: self.live_group_list.setCurrentRow(0)
+        if self.vod_group_list.count() > 0: self.vod_group_list.setCurrentRow(0)
+        if self.series_group_list.count() > 0: self.series_group_list.setCurrentRow(0)
+
+        # Init Player if available
+        if HAS_MULTIMEDIA:
+            self.media_player = QMediaPlayer()
+            self.audio_output = QAudioOutput()
+            self.media_player.setAudioOutput(self.audio_output)
+            # We need to switch video output when tabs change
+            self.tabs.currentChanged.connect(self.on_tab_changed)
+            # Set initial output
+            self.on_tab_changed(self.tabs.currentIndex())
+
+    @Slot(str)
+    def on_load_error(self, error_msg):
+        QMessageBox.warning(self, "Load Error", f"Failed to load playlist data: {error_msg}")
+        self.live_status_label.setText("Error loading data.")
+
+    def on_tab_changed(self, index):
+        if not HAS_MULTIMEDIA: return
+        self.media_player.stop() # Stop playback on tab switch
+        # Set video output to the widget in the current tab
+        if index == 0: # Live
+            self.media_player.setVideoOutput(self.live_video_widget)
+        elif index == 1: # VOD
+            self.media_player.setVideoOutput(self.vod_video_widget)
+        elif index == 2: # Series
+            self.media_player.setVideoOutput(self.series_video_widget)
+
+    def toggle_mute(self):
+        self.is_muted = not self.is_muted
+        self.set_embedded_mute(self.is_muted)
+        state_text = "Muted" if self.is_muted else "Unmuted"
+        QMessageBox.information(self, "Mute", f"Audio is now {state_text}")
+
+    def set_embedded_mute(self, muted):
+        if HAS_MULTIMEDIA:
+            self.audio_output.setMuted(muted)
+
+    def cast_current_stream(self):
+        if not HAS_CHROMECAST:
+            error_details = f"\n\nError details: {CHROMECAST_IMPORT_ERROR}" if CHROMECAST_IMPORT_ERROR else ""
+            QMessageBox.warning(self, "Missing Dependency",
+                                "The 'pychromecast' library is required for casting but could not be imported.\n"
+                                "Please ensure it is installed (pip install pychromecast)."
+                                f"{error_details}")
+            return
+
+        # Get current stream
+        current_tab_idx = self.tabs.currentIndex()
+        table = None
+        if current_tab_idx == 0: table = self.live_table
+        elif current_tab_idx == 1: table = self.vod_table
+        elif current_tab_idx == 2: table = self.series_table
+
+        if not table: return
+
+        selected_items = table.selectedItems()
+        if not selected_items:
+            QMessageBox.information(self, "Cast", "Select a stream to cast first.")
+            return
+
+        row = selected_items[0].row()
+        stream_url = self.get_stream_url(table, row)
+        stream_name = table.item(row, 1).text()
+
+        if not stream_url: return
+
+        # Discover devices
+        self.live_status_label.setText("Searching for Chromecast devices...") # Use status label for feedback
+        QApplication.processEvents() # Force UI update
+
+        try:
+            # Use get_chromecasts() which returns a list of Chromecast objects
+            # This handles discovery and object creation in one step
+            chromecasts, browser = pychromecast.get_chromecasts()
+            # browser.stop_discovery() # get_chromecasts manages discovery? Documentation varies, but let's be safe or rely on it.
+            # Note: get_chromecasts returns (casts, browser). We should probably stop discovery if we are done.
+            # But normally we might want to keep it if we expect dynamic updates.
+            # For this simple "click to cast", a one-shot is fine.
+            # pychromecast examples often don't explicitly stop browser if just using the list returned.
+
+            if not chromecasts:
+                self.live_status_label.setText("No Chromecast devices found.")
+                QMessageBox.warning(self, "Cast", "No Chromecast devices found on the network.")
+                return
+
+            device_map = {c.name: c for c in chromecasts}
+            device_names = list(device_map.keys())
+
+            device_name, ok = QInputDialog.getItem(self, "Select Device", "Choose Chromecast:", device_names, 0, False)
+
+            if ok and device_name:
+                cast = device_map[device_name]
+                cast.wait()
+                mc = cast.media_controller
+                mc.play_media(stream_url, 'video/mp4', title=stream_name)
+                mc.block_until_active()
+
+                self.live_status_label.setText(f"Casting to {device_name}...")
+                QMessageBox.information(self, "Casting", f"Casting '{stream_name}' to {device_name}")
+            else:
+                self.live_status_label.setText("Casting cancelled.")
+
+        except Exception as e:
+            logging.error(f"Chromecast Error: {e}")
+            QMessageBox.critical(self, "Cast Error", f"An error occurred while trying to cast:\n{e}")
+            self.live_status_label.setText("Error during casting.")
+
+    def filter_channels_by_search(self, text, tab_title):
+        search_text = text.lower()
+        target_table = None
+        target_list = None # The source data list
+
+        if tab_title == "Live TV":
+            target_table = self.live_table
+            target_list = self.live_streams # Full list
+            cat_map = self.live_cat_map
+        elif tab_title == "VOD":
+            target_table = self.vod_table
+            target_list = self.vod_streams
+            cat_map = self.vod_cat_map
+        elif tab_title == "Series":
+            target_table = self.series_table
+            target_list = self.series_streams
+            cat_map = self.series_cat_map
+
+        if not target_table: return
+
+        # If search is empty, revert to category filter
+        if not search_text:
+             if tab_title == "Live TV": self.filter_live_streams()
+             elif tab_title == "VOD": self.filter_vod_streams()
+             elif tab_title == "Series": self.filter_series_streams()
+             return
+
+        # Perform Search Filter
+        filtered = [x for x in target_list if search_text in x.get('name', x.get('num', '')).lower()]
+        self.populate_table(target_table, filtered, cat_map)
+
+    def populate_list(self, list_widget, categories):
+        list_widget.clear()
+        # Add "All Categories"
+        item_all = QListWidgetItem("All Categories")
+        item_all.setData(Qt.UserRole, None)
+        list_widget.addItem(item_all)
+
+        for cat in categories:
+            name = cat.get('category_name', 'Unknown')
+            cid = cat.get('category_id')
+            item = QListWidgetItem(name)
+            item.setData(Qt.UserRole, cid)
+            list_widget.addItem(item)
+
+    def populate_table(self, table, data_list, cat_map):
+        table.setRowCount(0)
+        if not data_list: return
+        table.setRowCount(len(data_list))
+
+        for row, item in enumerate(data_list):
+            stream_id = str(item.get('stream_id', item.get('series_id', '')))
+            name = item.get('name', item.get('num', ''))
+            cat_id = str(item.get('category_id', ''))
+            cat_name = cat_map.get(cat_id, "Unknown")
+
+            # Group Name
+            table.setItem(row, 0, QTableWidgetItem(cat_name))
+            # Channel Name
+            table.setItem(row, 1, QTableWidgetItem(name))
+
+            # Play Button (Action)
+            btn = QPushButton()
+            btn.setIcon(QIcon.fromTheme("media-playback-start")) # Try system theme or just text
+            if btn.icon().isNull():
+                btn.setText("▶")
+            btn.setFixedWidth(40)
+            btn.clicked.connect(lambda checked, r=row, t=table: self.play_stream_from_button(r, t))
+            table.setCellWidget(row, 2, btn)
+
+            # Stream ID (Hidden)
+            table.setItem(row, 3, QTableWidgetItem(stream_id))
+
+    def filter_live_streams(self):
+        self._filter_and_update(self.live_table, self.live_streams, self.live_group_list, self.live_cat_map)
+
+    def filter_vod_streams(self):
+        self._filter_and_update(self.vod_table, self.vod_streams, self.vod_group_list, self.vod_cat_map)
+
+    def filter_series_streams(self):
+        self._filter_and_update(self.series_table, self.series_streams, self.series_group_list, self.series_cat_map)
+
+    def _filter_and_update(self, table, all_data, list_widget, cat_map):
+        current_item = list_widget.currentItem()
+        if not current_item: return
+        cat_id = current_item.data(Qt.UserRole)
+
+        filtered = all_data
+        if cat_id is not None:
+            filtered = [x for x in all_data if str(x.get('category_id', '')) == str(cat_id)]
+
+        self.populate_table(table, filtered, cat_map)
+
+        # Update status label
+        count = len(filtered)
+        type_name = "items"
+        singular_type = "item"
+
+        if table == self.live_table:
+            type_name = "channels"
+            singular_type = "channel"
+        elif table == self.vod_table:
+            type_name = "movies"
+            singular_type = "movie"
+        elif table == self.series_table:
+            type_name = "series"
+            singular_type = "series"
+
+        status_text = f"Loaded {count} {type_name}. Select a {singular_type} to view its guide."
+
+        if table == self.live_table:
+            self.live_status_label.setText(status_text)
+        elif table == self.vod_table:
+            self.vod_status_label.setText(status_text)
+        elif table == self.series_table:
+            self.series_status_label.setText(status_text)
+
+    def play_selected_external(self):
+        # Determine current tab
+        current_tab_idx = self.tabs.currentIndex()
+        table = None
+        if current_tab_idx == 0: table = self.live_table
+        elif current_tab_idx == 1: table = self.vod_table
+        elif current_tab_idx == 2: table = self.series_table
+
+        if not table: return
+
+        # Get selected row
+        selected_items = table.selectedItems()
+        if not selected_items:
+            QMessageBox.information(self, "Play Selected", "Please select a channel/stream first.")
+            return
+
+        row = selected_items[0].row()
+        stream_url = self.get_stream_url(table, row)
+
+        if not stream_url:
+            QMessageBox.information(self, "Info", "Could not determine stream URL.")
+            return
+
+        try:
+            # Mute embedded player before starting external one
+            self.is_muted = True
+            self.set_embedded_mute(True)
+
+            # Ensure SDL_WINDOWID is NOT set for external playback
+            env = os.environ.copy()
+            if 'SDL_WINDOWID' in env:
+                del env['SDL_WINDOWID']
+
+            # Pass User-Agent to ffplay and open in separate window (default behavior)
+            cmd = ['ffplay', '-user_agent', USER_AGENT, '-autoexit', '-window_title', f"Stream: {table.item(row, 1).text()}", stream_url]
+            subprocess.Popen(cmd, env=env)
+        except FileNotFoundError:
+            QMessageBox.critical(self, "Error", "ffplay not found. Please ensure FFmpeg is installed and in your system PATH.")
+
+    def get_stream_url(self, table, row):
+        stream_id = table.item(row, 3).text()
+        stream_type = "live"
+        extension = "ts"
+        if table == self.vod_table:
+            stream_type = "movie"
+            extension = "mp4"
+        elif table == self.series_table:
+            # Series playback direct is tricky, usually series ID -> episodes.
+            # For this MVP, we try standard endpoint but might fail for containers.
+            stream_type = "series"
+            extension = "mp4"
+
+        if stream_type == "series":
+             return None # Block series for now or handle differently
+
+        return f"{self.server_url.rstrip('/')}/{stream_type}/{self.username}/{self.password}/{stream_id}.{extension}"
+
+    def play_stream_from_table_doubleclick(self, index):
+        # Double click on table just starts the preview immediately
+        self.start_preview_playback()
+
+    def on_table_selection_changed(self, table):
+        """Handle selection changes (mouse click or keyboard nav) to update EPG and embedded player."""
+        selected_items = table.selectedItems()
+        if not selected_items: return
+
+        # In single row selection, we just grab the first item's row
+        row = selected_items[0].row()
+
+        # 1. Load EPG
+        stream_id_item = table.item(row, 3) # Hidden Stream ID column
+        if stream_id_item:
+            stream_id = stream_id_item.text()
+            self.load_epg_for_stream(stream_id)
+
+        # 2. Start Preview Timer (Debounce)
+        # We restart the timer on every selection change. Playback starts when user stops scrolling.
+        self.preview_timer.start()
+
+    def start_preview_playback(self):
+        # Determine current tab
+        current_tab_idx = self.tabs.currentIndex()
+        table = None
+        video_widget = None
+        if current_tab_idx == 0:
+            table = self.live_table
+            video_widget = self.live_video_widget
+        elif current_tab_idx == 1:
+            table = self.vod_table
+            video_widget = self.vod_video_widget
+        elif current_tab_idx == 2:
+            table = self.series_table
+            video_widget = self.series_video_widget
+
+        if not table or not video_widget: return
+
+        selected_items = table.selectedItems()
+        if not selected_items: return
+        row = selected_items[0].row()
+
+        self.play_stream_embedded(table, row, video_widget)
+
+    def play_stream_from_button(self, row, table):
+        # Double click action: Try embedded first, else standard logic
+        # Actually, double click often implies "Play fully", but here we treat as "Force Preview Update"
+        # or we could make it open external.
+        # Let's make double-click behave like the "Play External" button if embedded isn't available?
+        # Or just update preview.
+        self.start_preview_playback()
+
+    def play_stream_embedded(self, table, row, video_widget):
+        """Plays the stream in the small embedded video widget."""
+        stream_url = self.get_stream_url(table, row)
+        if not stream_url: return
+
+        if HAS_MULTIMEDIA:
+            self.media_player.stop()
+            self.media_player.setSource(QUrl(stream_url))
+            self.media_player.play()
+        else:
+            # Attempt FFplay embedding
+            self.cleanup_ffplay()
+
+            # Get Window ID of the widget
+            try:
+                win_id = int(video_widget.winId())
+
+                # Prepare Env
+                env = os.environ.copy()
+                env['SDL_WINDOWID'] = str(win_id)
+
+                # Command
+                cmd = [
+                    'ffplay',
+                    '-user_agent', USER_AGENT,
+                    '-noborder',
+                    '-infbuf', # Low latency
+                    '-loglevel', 'warning', # Changed from quiet to warning for debugging
+                    '-x', str(video_widget.width()), # Hint size
+                    '-y', str(video_widget.height()),
+                    stream_url
+                ]
+
+                self.ffplay_process = subprocess.Popen(cmd, env=env)
+
+            except Exception as e:
+                logging.error(f"Failed to embed ffplay: {e}")
+                # Fallback? Maybe just log.
+
+
+    def load_epg_for_stream(self, stream_id):
+        # Determine which list widget to use based on current tab
+        current_tab_idx = self.tabs.currentIndex()
+        epg_list = None
+        if current_tab_idx == 0: epg_list = self.live_epg_list
+        elif current_tab_idx == 1: epg_list = self.vod_epg_list
+        elif current_tab_idx == 2: epg_list = self.series_epg_list
+
+        if not epg_list: return
+
+        epg_list.clear()
+        epg_list.addItem("Loading EPG...")
+        QApplication.processEvents()
+
+        try:
+            epg_data = get_epg_for_stream(self.server_url, self.username, self.password, stream_id)
+            epg_list.clear()
+
+            if not epg_data:
+                epg_list.addItem("No EPG Data Found")
+                return
+
+            current_ts = time.time() # UTC timestamp roughly
+            # Adjust if needed. XC usually returns server time text but UTC timestamps.
+            # We will use timestamps for logic.
+            logging.debug(f"EPG Highlight Check: Current System TS={current_ts}")
+
+            found_current = False
+
+            for prog in epg_data:
+                # Structure: start, end, title, description, start_timestamp, stop_timestamp
+                # Decode title/desc if they are base64 (common in XC)
+                title = decode_base64_text(prog.get('title'))
+                desc = decode_base64_text(prog.get('description', ''))
+
+                # get_simple_data_table might use different keys or format?
+                # Usually it has 'title', 'description', 'start_timestamp', 'stop_timestamp' just like short epg.
+                # It might also have 'start' and 'end' as strings.
+
+                start_ts_val = prog.get('start_timestamp', 0)
+                stop_ts_val = prog.get('stop_timestamp', 0)
+
+                # Ensure integer casting handles strings
+                start_ts = int(start_ts_val) if start_ts_val else 0
+                stop_ts = int(stop_ts_val) if stop_ts_val else 0
+
+                # Format time
+                # Convert UTC timestamp to local display time
+                try:
+                    dt_start = datetime.fromtimestamp(start_ts, tz=timezone.utc).astimezone(DISPLAY_TZ)
+                    dt_stop = datetime.fromtimestamp(stop_ts, tz=timezone.utc).astimezone(DISPLAY_TZ)
+                    time_str = f"{dt_start.strftime('%I:%M %p')} - {dt_stop.strftime('%I:%M %p')}"
+                except Exception:
+                    time_str = f"{prog.get('start')} - {prog.get('end')}"
+
+                # Create Item
+                item_text = f"{time_str}\n{title}"
+                if desc:
+                    # Truncate desc if too long
+                    if len(desc) > 100: desc = desc[:100] + "..."
+                    item_text += f"\n{desc}"
+
+                item = QListWidgetItem(item_text)
+
+                # Highlight Current Program
+                # Logic: start_ts <= current_ts < stop_ts
+                # Note: XC timestamps are usually correct UTC.
+                is_current = start_ts <= current_ts < stop_ts
+
+                # Debug logging for the first few items or if match found
+                if is_current:
+                    logging.debug(f"EPG Match Found: {title} ({start_ts} <= {current_ts} < {stop_ts})")
+
+                if is_current:
+                    # Green/Blue highlighting
+                    # Use a color that works for light/dark themes or hardcode a safe pastel
+                    item.setBackground(QColor("#e6f7ff")) # Light Blue
+                    item.setForeground(QColor("black")) # Ensure text is readable
+                    found_current = True
+
+                epg_list.addItem(item)
+
+                if found_current:
+                    epg_list.scrollToItem(item)
+                    found_current = False # Scrolled once
+
+        except Exception as e:
+            epg_list.clear()
+            epg_list.addItem(f"Error loading EPG: {e}")
+            logging.error(f"EPG Load Error: {e}")
+
 
 # =============================================================================
 # API CHECKER WORKER
 # =============================================================================
+class PlaylistLoaderWorker(QObject):
+    data_ready = Signal(dict)
+    error_occurred = Signal(str)
+    finished = Signal()
+
+    def __init__(self, server_url, username, password):
+        super().__init__()
+        self.server_url = server_url
+        self.username = username
+        self.password = password
+
+    @Slot()
+    def load_all(self):
+        try:
+            # Create a session for reuse
+            session = requests.Session()
+
+            # Fetch Categories
+            live_cats = get_live_categories(self.server_url, self.username, self.password, session)
+            vod_cats = get_vod_categories(self.server_url, self.username, self.password, session)
+            series_cats = get_series_categories(self.server_url, self.username, self.password, session)
+
+            # Fetch Streams
+            live_streams = get_live_streams_all(self.server_url, self.username, self.password, session)
+            vod_streams = get_vod_streams_all(self.server_url, self.username, self.password, session)
+            series_streams = get_series_all(self.server_url, self.username, self.password, session)
+
+            data = {
+                'live_cats': live_cats,
+                'vod_cats': vod_cats,
+                'series_cats': series_cats,
+                'live_streams': live_streams,
+                'vod_streams': vod_streams,
+                'series_streams': series_streams
+            }
+            self.data_ready.emit(data)
+        except Exception as e:
+            self.error_occurred.emit(str(e))
+        finally:
+            self.finished.emit()
+
 class ApiCheckerWorker(QObject):
     result_ready = Signal(int, dict)
     status_message_updated = Signal(str)
@@ -1168,13 +2230,16 @@ class ApiCheckerWorker(QObject):
 # =============================================================================
 # CUSTOM PROXY MODEL FOR FILTERING
 # =============================================================================
-COL_ID, COL_NAME, COL_CATEGORY, COL_STATUS, COL_CHANNELS, COL_MOVIES, COL_SERIES, COL_EXPIRY, COL_TRIAL, \
-COL_ACTIVE_CONN, COL_MAX_CONN, COL_LAST_CHECKED, COL_SERVER, COL_USER, COL_PASSWORD, COL_MSG = range(16)
+COL_ID, COL_NAME, COL_CATEGORY, COL_COMMENTS, COL_STATUS, COL_CHANNELS, COL_MOVIES, COL_SERIES, COL_EXPIRY, \
+COL_ACTIVE_CONN, COL_MAX_CONN, COL_LAST_CHECKED, COL_SERVER, COL_SERVER_IP, COL_USER, COL_PASSWORD, COL_MSG, COL_SERVICE = range(18)
 
 class EntryFilterProxyModel(QSortFilterProxyModel):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._search_text = ""
+        self._status_filter = "All Statuses"
+        self._server_filter = "All Servers"
+        self._server_ip_filter = "All IPs"
         self._exclude_na = False
         self._na_strings = {"N/A", "INVALID", "NOT CHECKED", "NEVER"}
 
@@ -1182,15 +2247,63 @@ class EntryFilterProxyModel(QSortFilterProxyModel):
         self._search_text = text.lower()
         self.invalidateFilter()
 
+    def set_status_filter(self, status):
+        self._status_filter = status
+        self.invalidateFilter()
+
+    def set_server_filter(self, server):
+        self._server_filter = server
+        self.invalidateFilter()
+
+    def set_server_ip_filter(self, server_ip):
+        self._server_ip_filter = server_ip
+        self.invalidateFilter()
+
     def set_exclude_na(self, exclude):
         self._exclude_na = exclude
         self.invalidateFilter()
 
+    def lessThan(self, left, right):
+        if left.column() in [COL_ACTIVE_CONN, COL_MAX_CONN, COL_CHANNELS, COL_MOVIES, COL_SERIES, COL_ID]:
+            left_data = self.sourceModel().data(left)
+            right_data = self.sourceModel().data(right)
+
+            def to_float(val):
+                try:
+                    return float(val)
+                except (ValueError, TypeError):
+                    return -1.0 # Treat N/A or invalid as lowest
+
+            return to_float(left_data) < to_float(right_data)
+
+        return super().lessThan(left, right)
+
     def filterAcceptsRow(self, source_row, source_parent):
+        # Status Filter
+        if self._status_filter != "All Statuses":
+            idx = self.sourceModel().index(source_row, COL_STATUS, source_parent)
+            status_val = str(self.sourceModel().data(idx))
+            if status_val != self._status_filter:
+                return False
+
+        # Server Filter
+        if self._server_filter != "All Servers":
+            idx = self.sourceModel().index(source_row, COL_SERVER, source_parent)
+            server_val = str(self.sourceModel().data(idx))
+            if server_val != self._server_filter:
+                return False
+
+        # Server IP Filter
+        if self._server_ip_filter != "All IPs":
+            idx = self.sourceModel().index(source_row, COL_SERVER_IP, source_parent)
+            ip_val = str(self.sourceModel().data(idx))
+            if ip_val != self._server_ip_filter:
+                return False
+
         search_match = True
         if self._search_text:
             search_match = False
-            search_columns = [COL_NAME, COL_CATEGORY, COL_STATUS, COL_SERVER, COL_USER, COL_MSG]
+            search_columns = [COL_NAME, COL_CATEGORY, COL_COMMENTS, COL_STATUS, COL_SERVER, COL_SERVER_IP, COL_USER, COL_MSG, COL_SERVICE]
             for col in search_columns:
                 idx = self.sourceModel().index(source_row, col, source_parent)
                 data = self.sourceModel().data(idx)
@@ -1201,7 +2314,7 @@ class EntryFilterProxyModel(QSortFilterProxyModel):
             return False
 
         if self._exclude_na:
-            na_check_columns = [COL_EXPIRY, COL_TRIAL, COL_ACTIVE_CONN, COL_MAX_CONN, COL_LAST_CHECKED, COL_STATUS]
+            na_check_columns = [COL_EXPIRY, COL_ACTIVE_CONN, COL_MAX_CONN, COL_LAST_CHECKED, COL_STATUS]
             for col in na_check_columns:
                 idx = self.sourceModel().index(source_row, col, source_parent)
                 data_str = str(self.sourceModel().data(idx)).upper()
@@ -1209,10 +2322,53 @@ class EntryFilterProxyModel(QSortFilterProxyModel):
                     return False
         return True
 
+class ClearableComboBox(QComboBox):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+
+        self.clear_button = QToolButton(self)
+        # Use a standard close icon (x)
+        self.clear_button.setIcon(self.style().standardIcon(QStyle.SP_DialogResetButton))
+        # Fallback to text if no icon
+        if self.clear_button.icon().isNull():
+             self.clear_button.setText("x")
+
+        self.clear_button.setCursor(Qt.ArrowCursor)
+        self.clear_button.setStyleSheet("QToolButton { border: none; padding: 0px; background-color: transparent; }")
+        self.clear_button.hide()
+        self.clear_button.clicked.connect(self.clear_selection)
+
+        self.currentIndexChanged.connect(self.update_clear_button)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        # Position the button to the right, inside the frame
+        # Adjust size and position
+        sz = self.clear_button.sizeHint()
+        frame_width = self.style().pixelMetric(QStyle.PM_DefaultFrameWidth)
+        # We need to account for the dropdown arrow width
+        arrow_width = 20 # Approximate
+
+        # Position slightly to the left of the arrow
+        x = self.rect().right() - frame_width - arrow_width - sz.width()
+        y = (self.rect().bottom() + 1 - sz.height()) // 2
+
+        self.clear_button.move(x, y)
+
+    def update_clear_button(self):
+        # Show button if index > 0 (assuming 0 is "All ...")
+        if self.currentIndex() > 0:
+            self.clear_button.show()
+        else:
+            self.clear_button.hide()
+
+    def clear_selection(self):
+        self.setCurrentIndex(0)
+
 # =============================================================================
 # MAIN APPLICATION WINDOW
 # =============================================================================
-COLUMN_HEADERS = ["ID", "Name", "Category", "API Status", "Channels", "Movies", "Series", "Expires", "Trial?", "Active", "Max", "Last Checked", "Server", "User / MAC", "Password", "Message"]
+COLUMN_HEADERS = ["ID", "Name", "Category", "Comments", "Status", "Channels", "Movies", "Series", "Expires", "Active", "Max", "Last Checked", "Server", "Server IP", "User / MAC", "Password", "Message", "Service"]
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -1270,18 +2426,20 @@ class MainWindow(QMainWindow):
 
         top_controls_layout = QHBoxLayout()
         self.add_button = QPushButton("Add Entry")
-        self.edit_button = QPushButton("Edit Selected")
         self.delete_button = QPushButton("Delete Selected")
         self.delete_duplicates_button = QPushButton("Delete Duplicates")
         self.bulk_edit_button = QPushButton("Bulk Edit")
+        self.bulk_edit_comments_button = QPushButton("Bulk Edit Comments")
+        self.bulk_edit_service_button = QPushButton("Bulk Edit Service")
         self.import_url_button = QPushButton("Import URL")
         self.import_file_button = QPushButton("Import File")
 
         top_controls_layout.addWidget(self.add_button)
-        top_controls_layout.addWidget(self.edit_button)
         top_controls_layout.addWidget(self.delete_button)
         top_controls_layout.addWidget(self.delete_duplicates_button)
         top_controls_layout.addWidget(self.bulk_edit_button)
+        top_controls_layout.addWidget(self.bulk_edit_comments_button)
+        top_controls_layout.addWidget(self.bulk_edit_service_button)
         top_controls_layout.addSpacing(10)
         top_controls_layout.addWidget(self.import_url_button)
         top_controls_layout.addWidget(self.import_file_button)
@@ -1302,9 +2460,11 @@ class MainWindow(QMainWindow):
         top_controls_layout.addWidget(self.export_csv_button)
 
         secondary_controls_layout = QHBoxLayout()
+        self.view_playlist_button = QPushButton("View Playlist/EPG")
         self.check_selected_button = QPushButton("Check Selected")
         self.check_all_button = QPushButton("Check All Visible")
         self.manage_categories_button = QPushButton("Categories...")
+        secondary_controls_layout.addWidget(self.view_playlist_button)
         secondary_controls_layout.addWidget(self.check_selected_button)
         secondary_controls_layout.addWidget(self.check_all_button)
         secondary_controls_layout.addStretch()
@@ -1314,13 +2474,29 @@ class MainWindow(QMainWindow):
         filter_controls_layout = QHBoxLayout()
         filter_controls_layout.addWidget(QLabel("Search:"))
         self.search_edit = QLineEdit()
+        self.search_edit.setClearButtonEnabled(True)
         self.search_edit.setPlaceholderText("Type to search...")
         filter_controls_layout.addWidget(self.search_edit)
         filter_controls_layout.addSpacing(10)
         filter_controls_layout.addWidget(QLabel("Category:"))
-        self.category_filter_combo = QComboBox()
+        self.category_filter_combo = ClearableComboBox()
         self.category_filter_combo.setMinimumWidth(150)
         filter_controls_layout.addWidget(self.category_filter_combo)
+        filter_controls_layout.addSpacing(10)
+        filter_controls_layout.addWidget(QLabel("Status:"))
+        self.status_filter_combo = ClearableComboBox()
+        self.status_filter_combo.setMinimumWidth(150)
+        filter_controls_layout.addWidget(self.status_filter_combo)
+        filter_controls_layout.addSpacing(10)
+        filter_controls_layout.addWidget(QLabel("Server:"))
+        self.server_filter_combo = ClearableComboBox()
+        self.server_filter_combo.setMinimumWidth(150)
+        filter_controls_layout.addWidget(self.server_filter_combo)
+        filter_controls_layout.addSpacing(10)
+        filter_controls_layout.addWidget(QLabel("Server IP:"))
+        self.server_ip_filter_combo = ClearableComboBox()
+        self.server_ip_filter_combo.setMinimumWidth(150)
+        filter_controls_layout.addWidget(self.server_ip_filter_combo)
         self.exclude_na_button = QPushButton("Exclude N/A")
         self.exclude_na_button.setCheckable(True)
         filter_controls_layout.addWidget(self.exclude_na_button)
@@ -1336,27 +2512,35 @@ class MainWindow(QMainWindow):
 
         self.table_view.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table_view.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        self.table_view.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table_view.setEditTriggers(QAbstractItemView.DoubleClicked | QAbstractItemView.EditKeyPressed)
         self.table_view.setSortingEnabled(True)
         self.table_view.sortByColumn(COL_NAME, Qt.AscendingOrder)
         header = self.table_view.horizontalHeader()
-        header.setSectionResizeMode(COL_ID, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(COL_ID, QHeaderView.Interactive)
+        self.table_view.setColumnWidth(COL_ID, 50)
         header.setSectionResizeMode(COL_NAME, QHeaderView.Interactive)
         self.table_view.setColumnWidth(COL_NAME, 200)
-        header.setSectionResizeMode(COL_CATEGORY, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(COL_CATEGORY, QHeaderView.Interactive)
+        self.table_view.setColumnWidth(COL_CATEGORY, 150)
+        header.setSectionResizeMode(COL_COMMENTS, QHeaderView.Interactive)
+        self.table_view.setColumnWidth(COL_COMMENTS, 150)
         header.setSectionResizeMode(COL_STATUS, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(COL_CHANNELS, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(COL_MOVIES, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(COL_SERIES, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(COL_EXPIRY, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(COL_TRIAL, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(COL_ACTIVE_CONN, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(COL_MAX_CONN, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(COL_LAST_CHECKED, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(COL_SERVER, QHeaderView.Interactive)
         self.table_view.setColumnWidth(COL_SERVER, 150)
-        header.setSectionResizeMode(COL_USER, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(COL_MSG, QHeaderView.Stretch)
+        header.setSectionResizeMode(COL_SERVER_IP, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(COL_USER, QHeaderView.Interactive)
+        self.table_view.setColumnWidth(COL_USER, 150)
+        header.setSectionResizeMode(COL_PASSWORD, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(COL_MSG, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(COL_SERVICE, QHeaderView.Interactive)
+        self.table_view.setColumnWidth(COL_SERVICE, 150)
         main_layout.addWidget(self.table_view)
         self.setCentralWidget(main_widget)
         self.status_bar = QStatusBar()
@@ -1367,13 +2551,15 @@ class MainWindow(QMainWindow):
         self.status_bar.addPermanentWidget(self.progress_bar)
 
         self.add_button.clicked.connect(self.add_entry_action)
-        self.edit_button.clicked.connect(self.edit_entry_action)
         self.delete_button.clicked.connect(self.delete_entry_action)
         self.delete_duplicates_button.clicked.connect(self.delete_duplicates_action)
         self.bulk_edit_button.clicked.connect(self.bulk_edit_category_action)
+        self.bulk_edit_comments_button.clicked.connect(self.bulk_edit_comments_action)
+        self.bulk_edit_service_button.clicked.connect(self.bulk_edit_service_action)
         self.import_url_button.clicked.connect(self.import_from_url_action)
         self.import_file_button.clicked.connect(self.import_from_file_action)
         self.manage_categories_button.clicked.connect(self.manage_categories_action)
+        self.view_playlist_button.clicked.connect(self.view_playlist_action)
         self.check_selected_button.clicked.connect(self.check_selected_entries_action)
         self.check_all_button.clicked.connect(self.check_all_entries_action)
         self.export_clipboard_button.clicked.connect(self.export_current_to_clipboard)
@@ -1381,7 +2567,11 @@ class MainWindow(QMainWindow):
         self.export_csv_button.clicked.connect(self.export_table_to_csv)
 
         self.table_view.doubleClicked.connect(self.edit_entry_action)
+        self.table_model.itemChanged.connect(self.on_table_item_changed)
         self.category_filter_combo.currentTextChanged.connect(self.category_filter_changed)
+        self.status_filter_combo.currentTextChanged.connect(self.status_filter_changed)
+        self.server_filter_combo.currentTextChanged.connect(self.server_filter_changed)
+        self.server_ip_filter_combo.currentTextChanged.connect(self.server_ip_filter_changed)
         self.search_edit.textChanged.connect(self.on_search_text_changed)
         self.exclude_na_button.toggled.connect(self.on_exclude_na_toggled)
 
@@ -1396,10 +2586,76 @@ class MainWindow(QMainWindow):
         idx = self.category_filter_combo.findText(cur_sel); self.category_filter_combo.setCurrentIndex(idx if idx != -1 else 0)
         self.category_filter_combo.blockSignals(False)
 
+    def update_status_filter_combo(self):
+        cur_sel = self.status_filter_combo.currentText()
+        self.status_filter_combo.blockSignals(True)
+        self.status_filter_combo.clear()
+        self.status_filter_combo.addItem("All Statuses")
+
+        statuses = set()
+        for row in range(self.table_model.rowCount()):
+            item = self.table_model.item(row, COL_STATUS)
+            if item:
+                statuses.add(item.text())
+
+        self.status_filter_combo.addItems(sorted(list(statuses)))
+
+        idx = self.status_filter_combo.findText(cur_sel)
+        self.status_filter_combo.setCurrentIndex(idx if idx != -1 else 0)
+        self.status_filter_combo.blockSignals(False)
+
+    def update_server_filter_combo(self):
+        cur_sel = self.server_filter_combo.currentText()
+        self.server_filter_combo.blockSignals(True)
+        self.server_filter_combo.clear()
+        self.server_filter_combo.addItem("All Servers")
+
+        servers = set()
+        for row in range(self.table_model.rowCount()):
+            item = self.table_model.item(row, COL_SERVER)
+            if item:
+                servers.add(item.text())
+
+        self.server_filter_combo.addItems(sorted(list(servers)))
+
+        idx = self.server_filter_combo.findText(cur_sel)
+        self.server_filter_combo.setCurrentIndex(idx if idx != -1 else 0)
+        self.server_filter_combo.blockSignals(False)
+
+    def update_server_ip_filter_combo(self):
+        cur_sel = self.server_ip_filter_combo.currentText()
+        self.server_ip_filter_combo.blockSignals(True)
+        self.server_ip_filter_combo.clear()
+        self.server_ip_filter_combo.addItem("All IPs")
+
+        ips = set()
+        for row in range(self.table_model.rowCount()):
+            item = self.table_model.item(row, COL_SERVER_IP)
+            if item:
+                ips.add(item.text())
+
+        self.server_ip_filter_combo.addItems(sorted(list(ips)))
+
+        idx = self.server_ip_filter_combo.findText(cur_sel)
+        self.server_ip_filter_combo.setCurrentIndex(idx if idx != -1 else 0)
+        self.server_ip_filter_combo.blockSignals(False)
+
     @Slot(str)
     def category_filter_changed(self, cat_name):
         self.current_category_filter = cat_name;
         self.load_entries_to_table()
+
+    @Slot(str)
+    def status_filter_changed(self, status_text):
+        self.proxy_model.set_status_filter(status_text)
+
+    @Slot(str)
+    def server_filter_changed(self, server_text):
+        self.proxy_model.set_server_filter(server_text)
+
+    @Slot(str)
+    def server_ip_filter_changed(self, server_ip_text):
+        self.proxy_model.set_server_ip_filter(server_ip_text)
 
     @Slot(str)
     def on_search_text_changed(self, text):
@@ -1414,18 +2670,28 @@ class MainWindow(QMainWindow):
         try:
             for row_data in get_all_entries(category_filter=self.current_category_filter): self.table_model.appendRow(self.create_row_items(row_data))
         except Exception as e: logging.error(f"Error loading entries: {e}"); QMessageBox.critical(self, "Load Error", f"Could not load: {e}")
+
+        self.update_status_filter_combo()
+        self.update_server_filter_combo()
+        self.update_server_ip_filter_combo()
         self.proxy_model.invalidateFilter()
 
     def create_row_items(self, entry_data):
         items = []; id_item = QStandardItem(str(entry_data['id'])); id_item.setData(entry_data['id'], Qt.UserRole); items.append(id_item)
         items.append(QStandardItem(entry_data['name'])); items.append(QStandardItem(entry_data['category']))
+
+        # Add Comments column item
+        comments_text = ""
+        if 'comments' in entry_data.keys() and entry_data['comments']:
+            comments_text = entry_data['comments']
+        items.append(QStandardItem(comments_text))
+
         status_val = entry_data['api_status'] if entry_data['api_status'] is not None else "Not Checked"
         status_item = QStandardItem(status_val); self.apply_status_coloring(status_item, status_val); items.append(status_item)
         items.append(QStandardItem(str(entry_data['live_streams_count']) if entry_data['live_streams_count'] is not None else "N/A"))
         items.append(QStandardItem(str(entry_data['movies_count']) if entry_data['movies_count'] is not None else "N/A"))
         items.append(QStandardItem(str(entry_data['series_count']) if entry_data['series_count'] is not None else "N/A"))
         items.append(QStandardItem(format_timestamp_display(entry_data['expiry_date_ts'])))
-        items.append(QStandardItem(format_trial_status_display(entry_data['is_trial'])))
         active_c = entry_data['active_connections']; items.append(QStandardItem(str(active_c) if active_c is not None else "N/A"))
         max_c = entry_data['max_connections']; items.append(QStandardItem(str(max_c) if max_c is not None else "N/A"))
         last_chk_raw = entry_data['last_checked_at']; last_chk_disp = "Never"
@@ -1433,7 +2699,7 @@ class MainWindow(QMainWindow):
             try:
                 dt_utc = QDateTime.fromString(last_chk_raw.split('.')[0], Qt.ISODate).toUTC()
                 if not dt_utc.isValid() : dt_utc = QDateTime.fromString(last_chk_raw, Qt.ISODateWithMs).toUTC()
-                dt_local = dt_utc.toLocalTime(); last_chk_disp = dt_local.toString("yyyy-MM-dd hh:mm")
+                dt_local = dt_utc.toLocalTime(); last_chk_disp = dt_local.toString("yy-MM-dd hh:mm")
             except Exception as e: logging.warning(f"Error parsing last_checked_at '{last_chk_raw}': {e}")
         items.append(QStandardItem(last_chk_disp))
 
@@ -1443,15 +2709,48 @@ class MainWindow(QMainWindow):
 
         if account_type == 'stalker':
             items.append(QStandardItem(entry_data['portal_url'] or 'N/A')) # Server column
+            items.append(QStandardItem(entry_data['server_ip'] or "N/A")) # Server IP column
             items.append(QStandardItem(entry_data['mac_address'] or 'N/A')) # Username column, now User/MAC
-            items.append(QStandardItem("")) # Password column (empty for Stalker)
+            pwd_item = QStandardItem("") # Password column (empty for Stalker)
         else: # XC or if somehow account_type is None and defaulted to 'xc'
             items.append(QStandardItem(entry_data['server_base_url'] or 'N/A'))
-            items.append(QStandardItem(entry_data['username'] or 'N/A'))
-            items.append(QStandardItem(entry_data['password'] or '')) # Password column
+            items.append(QStandardItem(entry_data['server_ip'] or "N/A")) # Server IP column
+            user_item = QStandardItem(entry_data['username'] or 'N/A')
+            items.append(user_item)
+            pwd_item = QStandardItem(entry_data['password'] or '') # Password column
+
+        # Check for MAC address shading on the User item
+        # In Stalker mode, the username item is at index COL_USER
+        # We need to find the item we just appended.
+        # Since we append sequentially, let's grab the item at COL_USER
+        # Note: We are building a list 'items' to append to the row.
+        # COL_USER is index 14.
+        # Let's apply it to the item we just created.
+
+        # Determine which item is the user/mac item
+        user_mac_item = items[COL_USER]
+        self.apply_mac_shading(user_mac_item)
+
+        # Apply password column shading immediately upon creation
+        pwd_bg_color = QColor("#2b2b2b") if self.dark_theme_action.isChecked() else QColor("#e6e6e6")
+        pwd_item.setBackground(pwd_bg_color)
+        items.append(pwd_item)
 
         api_msg = entry_data['api_message'] if entry_data['api_message'] is not None else ""
         items.append(QStandardItem(api_msg))
+
+        # Add Service column item
+        service_text = ""
+        if 'service' in entry_data.keys() and entry_data['service']:
+            service_text = entry_data['service']
+        items.append(QStandardItem(service_text))
+
+        for i, item in enumerate(items):
+            if i == COL_COMMENTS or i == COL_SERVICE:
+                item.setFlags(item.flags() | Qt.ItemIsEditable)
+            else:
+                item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+
         return items
 
     def apply_status_coloring(self, item, status_text):
@@ -1487,9 +2786,11 @@ class MainWindow(QMainWindow):
 
         can_interact = not self._is_checking_api
 
-        self.edit_button.setEnabled(selected_row_count == 1 and can_interact)
+        self.view_playlist_button.setEnabled(selected_row_count == 1 and can_interact)
         self.delete_button.setEnabled(has_selection and can_interact)
         self.bulk_edit_button.setEnabled(has_selection and can_interact)
+        self.bulk_edit_comments_button.setEnabled(has_selection and can_interact)
+        self.bulk_edit_service_button.setEnabled(has_selection and can_interact)
         self.check_selected_button.setEnabled(has_selection and can_interact)
         self.export_txt_button.setEnabled(has_selection and can_interact)
         self.export_csv_button.setEnabled(self.proxy_model.rowCount() > 0 and can_interact)
@@ -1506,6 +2807,9 @@ class MainWindow(QMainWindow):
         self.manage_categories_button.setEnabled(can_interact)
 
         self.category_filter_combo.setEnabled(can_interact)
+        self.status_filter_combo.setEnabled(can_interact)
+        self.server_filter_combo.setEnabled(can_interact)
+        self.server_ip_filter_combo.setEnabled(can_interact)
         self.search_edit.setEnabled(can_interact)
         self.exclude_na_button.setEnabled(can_interact)
 
@@ -1523,6 +2827,10 @@ class MainWindow(QMainWindow):
             if not sel_proxied: return
             current_proxy_index = sel_proxied[0]
 
+        # Prevent opening edit dialog if editing a comment or service inline
+        if current_proxy_index.column() == COL_COMMENTS or current_proxy_index.column() == COL_SERVICE:
+            return
+
         src_idx = self.proxy_model.mapToSource(current_proxy_index)
         entry_id_item = self.table_model.itemFromIndex(src_idx.siblingAtColumn(COL_ID))
         if not entry_id_item: return
@@ -1530,6 +2838,44 @@ class MainWindow(QMainWindow):
 
         diag = EntryDialog(entry_id=entry_id, parent=self)
         if diag.exec(): self.refresh_row_by_id(entry_id); self.update_category_filter_combo()
+
+    @Slot()
+    def view_playlist_action(self):
+        current_proxy_index = self.table_view.currentIndex()
+        if not current_proxy_index.isValid(): return
+
+        src_idx = self.proxy_model.mapToSource(current_proxy_index)
+        entry_id_item = self.table_model.itemFromIndex(src_idx.siblingAtColumn(COL_ID))
+        if not entry_id_item: return
+        entry_id = entry_id_item.data(Qt.UserRole)
+
+        entry = get_entry_by_id(entry_id)
+        if not entry: return
+
+        account_type = entry['account_type'] if entry['account_type'] is not None else 'xc'
+
+        if account_type == 'xc':
+            dialog = PlaylistViewerDialog(entry['server_base_url'], entry['username'], entry['password'], self)
+            dialog.exec()
+        else:
+            QMessageBox.information(self, "Info", "Playlist viewer only supports Xtream Codes API accounts currently.")
+
+    @Slot(QStandardItem)
+    def on_table_item_changed(self, item):
+        if item.column() == COL_COMMENTS:
+            row = item.row()
+            id_item = self.table_model.item(row, COL_ID)
+            if id_item:
+                entry_id = id_item.data(Qt.UserRole)
+                new_comment = item.text()
+                update_entry_comment(entry_id, new_comment)
+        elif item.column() == COL_SERVICE:
+            row = item.row()
+            id_item = self.table_model.item(row, COL_ID)
+            if id_item:
+                entry_id = id_item.data(Qt.UserRole)
+                new_service = item.text()
+                update_entry_service(entry_id, new_service)
 
     @Slot()
     def bulk_edit_category_action(self):
@@ -1549,6 +2895,44 @@ class MainWindow(QMainWindow):
             except Exception as e:
                 logging.error(f"Error bulk updating categories: {e}")
                 QMessageBox.critical(self, "Database Error", f"Could not update categories: {e}")
+
+    @Slot()
+    def bulk_edit_comments_action(self):
+        selected_ids = self.get_selected_entry_ids()
+        if not selected_ids:
+            QMessageBox.information(self, "Bulk Edit Comments", "No entries selected.")
+            return
+
+        dialog = BulkEditCommentsDialog(parent=self)
+        if dialog.exec():
+            new_comment = dialog.get_comment()
+            try:
+                for entry_id in selected_ids:
+                    update_entry_comment(entry_id, new_comment)
+                self.load_entries_to_table()
+                QMessageBox.information(self, "Success", f"Comments updated for {len(selected_ids)} entries.")
+            except Exception as e:
+                logging.error(f"Error bulk updating comments: {e}")
+                QMessageBox.critical(self, "Database Error", f"Could not update comments: {e}")
+
+    @Slot()
+    def bulk_edit_service_action(self):
+        selected_ids = self.get_selected_entry_ids()
+        if not selected_ids:
+            QMessageBox.information(self, "Bulk Edit Service", "No entries selected.")
+            return
+
+        dialog = BulkEditServiceDialog(parent=self)
+        if dialog.exec():
+            new_service = dialog.get_service()
+            try:
+                for entry_id in selected_ids:
+                    update_entry_service(entry_id, new_service)
+                self.load_entries_to_table()
+                QMessageBox.information(self, "Success", f"Service updated for {len(selected_ids)} entries.")
+            except Exception as e:
+                logging.error(f"Error bulk updating service: {e}")
+                QMessageBox.critical(self, "Database Error", f"Could not update service: {e}")
 
     @Slot()
     def delete_entry_action(self):
@@ -1677,7 +3061,9 @@ class MainWindow(QMainWindow):
         failed_count = 0
 
         current_stalker_portal_url_for_mac_list = None
+        current_xc_server_url = None
         mac_pattern = re.compile(r"^([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})$")
+        xc_combo_pattern = re.compile(r"^([^:]+):([^:]+)$")
 
         try:
             with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
@@ -1690,6 +3076,7 @@ class MainWindow(QMainWindow):
                     is_xc_link = "get.php?" in line_content
                     # Check for MAC pattern first, as URLs can be short and might be misidentified by simple http check alone
                     is_potential_mac = mac_pattern.fullmatch(line_content) is not None # Use fullmatch for MAC
+                    is_xc_combo = xc_combo_pattern.fullmatch(line_content) is not None
 
                     # A line is a potential portal URL if it starts with http/https, is NOT an XC link, AND NOT a stalker credential string
                     is_potential_portal_url = (line_content.startswith("http://") or line_content.startswith("https://")) \
@@ -1697,6 +3084,7 @@ class MainWindow(QMainWindow):
 
                     if is_stalker_credential_string:
                         current_stalker_portal_url_for_mac_list = None # Reset context
+                        current_xc_server_url = None
                         try:
                             parts = line_content.split(',')
                             if len(parts) < 2: raise ValueError("Malformed stalker string, missing comma.")
@@ -1726,6 +3114,7 @@ class MainWindow(QMainWindow):
 
                     elif is_xc_link:
                         current_stalker_portal_url_for_mac_list = None # Reset context
+                        current_xc_server_url = None
                         parsed_info = parse_get_php_url(line_content)
                         if parsed_info and not parsed_info.get('error'):
                             try:
@@ -1741,11 +3130,25 @@ class MainWindow(QMainWindow):
                         parsed_val_url = urlparse(line_content)
                         if parsed_val_url.scheme and parsed_val_url.netloc: # Basic validation
                             current_stalker_portal_url_for_mac_list = line_content
-                            logging.info(f"Batch Import: Set current Stalker portal URL for subsequent MACs to: {current_stalker_portal_url_for_mac_list} (from line {line_num})")
+                            current_xc_server_url = line_content
+                            logging.info(f"Batch Import: Set current URL context to: {line_content} (from line {line_num})")
                         else:
                             logging.warning(f"Batch Import: Skipped potential URL (malformed or unsupported) on line {line_num}: {line_content}")
-                            # current_stalker_portal_url_for_mac_list = None # Keep previous context or reset? Let's keep for now.
                             failed_count +=1
+
+                    elif is_xc_combo and current_xc_server_url:
+                        try:
+                            match = xc_combo_pattern.match(line_content)
+                            if match:
+                                username = match.group(1)
+                                password = match.group(2)
+                                host = urlparse(current_xc_server_url).hostname or "host"
+                                display_name = f"{host}_{username}_L{line_num}"
+                                add_entry(display_name, default_category, current_xc_server_url, username, password)
+                                imported_count += 1
+                                logging.info(f"Batch Import: Successfully imported XC combo {username} for server {current_xc_server_url} from line {line_num}")
+                        except Exception as e_xc_combo:
+                            logging.error(f"Batch Import: Error processing XC combo on line {line_num}: {e_xc_combo}"); failed_count += 1
 
                     elif is_potential_mac and current_stalker_portal_url_for_mac_list:
                         mac_address = line_content.strip().upper() # Already validated by is_potential_mac basically
@@ -2066,18 +3469,17 @@ class MainWindow(QMainWindow):
             QApplication.instance().setStyleSheet("""
                 QWidget { background-color: #f0f0f0; color: #333; }
                 QTableView { background-color: white; selection-background-color: #a6cfff; }
-                QHeaderView::section { background-color: #e0e0e0; }
                 QPushButton { background-color: #d0d0d0; border: 1px solid #b0b0b0; padding: 5px; }
                 QPushButton:hover { background-color: #c0c0c0; }
                 QLineEdit, QComboBox { background-color: white; border: 1px solid #ccc; padding: 3px; }
             """)
+            default_header_bg = QColor("#e0e0e0")
         elif theme_name == "dark":
             self.dark_theme_action.setChecked(True)
             self.light_theme_action.setChecked(False)
             QApplication.instance().setStyleSheet("""
                 QWidget { background-color: #2e2e2e; color: #f0f0f0; }
                 QTableView { background-color: #3e3e3e; selection-background-color: #5a5a5a; }
-                QHeaderView::section { background-color: #4e4e4e; }
                 QPushButton { background-color: #5e5e5e; border: 1px solid #7e7e7e; padding: 5px; }
                 QPushButton:hover { background-color: #6e6e6e; }
                 QLineEdit, QComboBox { background-color: #4e4e4e; border: 1px solid #6e6e6e; padding: 3px; }
@@ -2085,8 +3487,56 @@ class MainWindow(QMainWindow):
                 QMenu::item:selected { background-color: #5a5a5a; }
                 QStatusBar { background-color: #2e2e2e; }
             """)
+            default_header_bg = QColor("#4e4e4e")
+
+        # Programmatically set default header background for all columns first
+        if hasattr(self, 'table_model') and self.table_model is not None:
+             for col in range(self.table_model.columnCount()):
+                 self.table_model.setHeaderData(col, Qt.Horizontal, default_header_bg, Qt.BackgroundRole)
+
+        # Apply specific password shading (overrides default for that column)
+        self.apply_password_column_shading()
+
         self.save_settings()
         self.refresh_table_coloring_on_theme_change() # Add this call
+
+    def apply_password_column_shading(self):
+        """Applies shading to the password column (header and cells)."""
+        if not hasattr(self, 'table_model') or self.table_model is None:
+            return
+
+        is_dark = self.dark_theme_action.isChecked()
+        # Define colors
+        header_bg = QColor("#3a3a3a") if is_dark else QColor("#d0d0d0")
+        cell_bg = QColor("#2b2b2b") if is_dark else QColor("#e6e6e6")
+
+        # Set Header Background for Password Column
+        self.table_model.setHeaderData(COL_PASSWORD, Qt.Horizontal, header_bg, Qt.BackgroundRole)
+
+        # Update existing rows
+        for row in range(self.table_model.rowCount()):
+            item = self.table_model.item(row, COL_PASSWORD)
+            if item:
+                item.setBackground(cell_bg)
+
+    def apply_mac_shading(self, item):
+        """Applies subtle blue shading to MAC addresses in the User column."""
+        if not item: return
+
+        text = item.text().strip()
+        # Regex for MAC address (XX:XX:XX:XX:XX:XX or XX-XX-XX-XX-XX-XX)
+        mac_pattern = re.compile(r"^([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})$")
+
+        if mac_pattern.match(text):
+            is_dark = self.dark_theme_action.isChecked()
+            # Subtle blue colors
+            bg_color = QColor("#1E3A5F") if is_dark else QColor("#E3F2FD")
+            item.setBackground(bg_color)
+        else:
+            # Clear background if it's not a MAC (or if previously set)
+            # Note: This might clear password shading if used on wrong column,
+            # but this function is intended for COL_USER.
+            item.setData(None, Qt.BackgroundRole)
 
     def refresh_table_coloring_on_theme_change(self):
         """Refreshes the coloring of status items in the table after a theme change."""
@@ -2094,12 +3544,21 @@ class MainWindow(QMainWindow):
             return
 
         logging.debug("Refreshing table item coloring due to theme change.")
+
+        # Re-apply password column shading
+        self.apply_password_column_shading()
+
         for row in range(self.table_model.rowCount()):
-            # Assuming COL_STATUS is the correct column index for the API status
+            # Apply Status Coloring
             status_item = self.table_model.item(row, COL_STATUS)
             if status_item:
                 status_text = status_item.text()
                 self.apply_status_coloring(status_item, status_text)
+
+            # Apply MAC Shading
+            user_item = self.table_model.item(row, COL_USER)
+            if user_item:
+                self.apply_mac_shading(user_item)
         # If using a proxy model, you might need to trigger an update for the view,
         # but changing item properties directly often reflects. If not, further signals might be needed.
 
@@ -2107,9 +3566,25 @@ class MainWindow(QMainWindow):
 # =============================================================================
 # APPLICATION ENTRY POINT
 # =============================================================================
+import traceback
+def excepthook(exc_type, exc_value, exc_traceback):
+    print(">>> UNCAUGHT EXCEPTION <<<")
+    traceback.print_exception(exc_type, exc_value, exc_traceback)
+
+sys.excepthook = excepthook
+
 if __name__ == "__main__":
     logging.getLogger().setLevel(logging.DEBUG)
     logging.info("Application starting with DEBUG level logging.")
+
+    # Fix for Windows Taskbar Icon
+    if sys.platform == 'win32':
+        try:
+            import ctypes
+            myappid = f"MyCompany.IPTVManagerPro.{APP_VERSION}" # Arbitrary string
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
+        except Exception as e:
+            logging.error(f"Failed to set AppUserModelID: {e}")
 
     if hasattr(Qt, 'AA_EnableHighDpiScaling'):
         QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
@@ -2127,14 +3602,3 @@ if __name__ == "__main__":
     main_window = MainWindow()
     main_window.show()
     sys.exit(app.exec())
-
-
-    import traceback
-import sys
-
-def excepthook(exc_type, exc_value, exc_traceback):
-    print(">>> UNCAUGHT EXCEPTION <<<")
-    traceback.print_exception(exc_type, exc_value, exc_traceback)
-    input("Press Enter to exit...")
-
-sys.excepthook = excepthook
