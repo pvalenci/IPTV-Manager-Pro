@@ -909,6 +909,52 @@ def check_stalker_portal_status(portal_url: str, mac_address: str, session: requ
     processed_data['success'] = False
     return processed_data
 
+def get_stalker_genres(session, portal_url, mac_address, token):
+    """Fetches genres (categories) from Stalker Portal."""
+    api_url = f"{portal_url.rstrip('/')}/portal.php?type=itv&action=get_genres&JsHttpRequest=1-xml"
+    headers = {**STALKER_COMMON_HEADERS, 'Authorization': f"Bearer {token}"}
+    try:
+        response = session.get(api_url, headers=headers, timeout=API_TIMEOUT)
+        response.raise_for_status()
+        data = response.json()
+        return data.get("js", [])
+    except Exception as e:
+        logging.error(f"Stalker: Error fetching genres: {e}")
+        return []
+
+def get_stalker_channels(session, portal_url, mac_address, token):
+    """Fetches all channels from Stalker Portal."""
+    api_url = f"{portal_url.rstrip('/')}/portal.php?type=itv&action=get_all_channels&JsHttpRequest=1-xml"
+    headers = {**STALKER_COMMON_HEADERS, 'Authorization': f"Bearer {token}"}
+    try:
+        response = session.get(api_url, headers=headers, timeout=10) # Higher timeout for big lists
+        response.raise_for_status()
+        data = response.json()
+        channels = data.get("js", {}).get("data", [])
+        return channels
+    except Exception as e:
+        logging.error(f"Stalker: Error fetching channels: {e}")
+        return []
+
+def get_stalker_stream_link(session, portal_url, mac_address, token, cmd):
+    """Generates a temporary playback link using create_link action."""
+    # cmd is typically the 'cmd' field from the channel object (e.g. "ffmpeg http://...")
+    api_url = f"{portal_url.rstrip('/')}/portal.php?type=itv&action=create_link&cmd={cmd}&JsHttpRequest=1-xml"
+    headers = {**STALKER_COMMON_HEADERS, 'Authorization': f"Bearer {token}"}
+    try:
+        response = session.get(api_url, headers=headers, timeout=API_TIMEOUT)
+        response.raise_for_status()
+        data = response.json()
+        # The result usually contains 'cmd' which is the raw URL, or 'js' -> 'cmd'
+        # Format varies. Often data['js']['cmd'] is the URL.
+        link = data.get("js", {}).get("cmd")
+        if not link:
+             logging.warning(f"Stalker: create_link returned no URL. Response: {data}")
+        return link
+    except Exception as e:
+        logging.error(f"Stalker: Error creating link for cmd '{cmd}': {e}")
+        return None
+
 
 # =============================================================================
 # DIALOGS
@@ -1307,15 +1353,18 @@ class BulkEditServiceDialog(QDialog):
         return self.service_edit.text()
 
 class PlaylistViewerDialog(QDialog):
-    def __init__(self, server_url, username, password, parent=None):
+    def __init__(self, server_url, username, password, account_type='xc', mac_address=None, portal_url=None, parent=None):
         super().__init__(parent)
-        self.setWindowTitle(f"Playlist Viewer - {server_url}")
+        self.setWindowTitle(f"Playlist Viewer - {server_url or portal_url}")
         self.resize(1200, 800)
         self.setWindowState(Qt.WindowMaximized)
         self.setWindowFlags(self.windowFlags() | Qt.WindowMinimizeButtonHint | Qt.WindowMaximizeButtonHint | Qt.WindowCloseButtonHint)
         self.server_url = server_url
         self.username = username
         self.password = password
+        self.account_type = account_type
+        self.mac_address = mac_address
+        self.portal_url = portal_url
 
         # Data storage
         self.live_streams = []
@@ -1361,7 +1410,10 @@ class PlaylistViewerDialog(QDialog):
         self.ffplay_process = None
 
         # Load data thread
-        self.load_worker = PlaylistLoaderWorker(self.server_url, self.username, self.password)
+        self.load_worker = PlaylistLoaderWorker(
+            self.server_url, self.username, self.password,
+            self.account_type, self.mac_address, self.portal_url
+        )
         self.load_thread = QThread()
         self.load_worker.moveToThread(self.load_thread)
 
@@ -1863,6 +1915,42 @@ class PlaylistViewerDialog(QDialog):
 
     def get_stream_url(self, table, row):
         stream_id = table.item(row, 3).text()
+
+        # --- Stalker Portal Handling ---
+        if self.account_type == 'stalker':
+             # For Stalker, stream_id is the 'cmd' needed for create_link
+             # We need to make a network call to get the temporary link.
+             # Since this method is called by UI events, making a sync network call
+             # might freeze UI slightly, but typically create_link is fast.
+             # We need a session and token.
+             # REUSE: We don't have the token stored in self directly unless we passed it.
+             # Wait, on_data_loaded received the data. But the token was embedded in the stream items?
+             # Yes, we stored it in the item data in PlaylistLoaderWorker!
+             # We need to retrieve it. But table items just have text usually.
+
+             # Let's see how we populated the table.
+             # We put stream_id in column 3.
+             # We didn't store the full item object in the table widgets, just text.
+             # However, we have self.live_streams list which contains the dicts.
+             # We can lookup by stream_id or index. But index is filtered.
+             # The table row corresponds to the FILTERED list, not the full list.
+             # We need to find the item in the data source that matches this stream_id.
+
+             # Optimization: Retrieve token from a new property or simple re-auth?
+             # Re-auth is safer for expiration. Let's try re-auth or store a session.
+             # Creating a new session here is easiest for robustness.
+             try:
+                 session = requests.Session()
+                 # We need a token. Handshake again.
+                 token = _get_stalker_token(session, self.portal_url, self.mac_address)
+                 if token:
+                     link = get_stalker_stream_link(session, self.portal_url, self.mac_address, token, stream_id)
+                     if link: return link
+             except Exception as e:
+                 logging.error(f"Stalker: Failed to get stream link: {e}")
+             return None
+
+        # --- Xtream Codes Handling ---
         stream_type = "live"
         extension = "ts"
         if table == self.vod_table:
@@ -2072,11 +2160,14 @@ class PlaylistLoaderWorker(QObject):
     error_occurred = Signal(str)
     finished = Signal()
 
-    def __init__(self, server_url, username, password):
+    def __init__(self, server_url, username, password, account_type='xc', mac_address=None, portal_url=None):
         super().__init__()
         self.server_url = server_url
         self.username = username
         self.password = password
+        self.account_type = account_type
+        self.mac_address = mac_address
+        self.portal_url = portal_url
 
     @Slot()
     def load_all(self):
@@ -2084,15 +2175,54 @@ class PlaylistLoaderWorker(QObject):
             # Create a session for reuse
             session = requests.Session()
 
-            # Fetch Categories
-            live_cats = get_live_categories(self.server_url, self.username, self.password, session)
-            vod_cats = get_vod_categories(self.server_url, self.username, self.password, session)
-            series_cats = get_series_categories(self.server_url, self.username, self.password, session)
+            if self.account_type == 'stalker':
+                # --- Stalker Portal Logic ---
+                token = _get_stalker_token(session, self.portal_url, self.mac_address)
+                if not token:
+                    raise Exception("Authentication Failed: Could not get Stalker token.")
 
-            # Fetch Streams
-            live_streams = get_live_streams_all(self.server_url, self.username, self.password, session)
-            vod_streams = get_vod_streams_all(self.server_url, self.username, self.password, session)
-            series_streams = get_series_all(self.server_url, self.username, self.password, session)
+                genres = get_stalker_genres(session, self.portal_url, self.mac_address, token)
+                channels = get_stalker_channels(session, self.portal_url, self.mac_address, token)
+
+                # Normalize Stalker Data to XC Structure
+                # Map Genres to Categories
+                live_cats = []
+                for g in genres:
+                    live_cats.append({
+                        'category_id': g.get('id'),
+                        'category_name': g.get('title')
+                    })
+
+                # Map Channels to Streams
+                live_streams = []
+                for c in channels:
+                    # Stalker channels have 'id', 'name', 'tv_genre_id', 'cmd' (stream url/id)
+                    live_streams.append({
+                        'stream_id': c.get('cmd'), # We store the 'cmd' as the stream_id for creating links later
+                        'num': c.get('number'),
+                        'name': c.get('name'),
+                        'category_id': c.get('tv_genre_id'),
+                        'is_stalker': True, # Flag for UI
+                        'token': token # Pass token if needed for immediate use, though better re-authed
+                    })
+
+                # Stalker VOD/Series not yet implemented in this view
+                vod_cats = []
+                series_cats = []
+                vod_streams = []
+                series_streams = []
+
+            else:
+                # --- Xtream Codes Logic ---
+                # Fetch Categories
+                live_cats = get_live_categories(self.server_url, self.username, self.password, session)
+                vod_cats = get_vod_categories(self.server_url, self.username, self.password, session)
+                series_cats = get_series_categories(self.server_url, self.username, self.password, session)
+
+                # Fetch Streams
+                live_streams = get_live_streams_all(self.server_url, self.username, self.password, session)
+                vod_streams = get_vod_streams_all(self.server_url, self.username, self.password, session)
+                series_streams = get_series_all(self.server_url, self.username, self.password, session)
 
             data = {
                 'live_cats': live_cats,
@@ -2100,7 +2230,10 @@ class PlaylistLoaderWorker(QObject):
                 'series_cats': series_cats,
                 'live_streams': live_streams,
                 'vod_streams': vod_streams,
-                'series_streams': series_streams
+                'series_streams': series_streams,
+                'account_type': self.account_type,
+                'portal_url': self.portal_url,
+                'mac_address': self.mac_address
             }
             self.data_ready.emit(data)
         except Exception as e:
@@ -2855,10 +2988,19 @@ class MainWindow(QMainWindow):
         account_type = entry['account_type'] if entry['account_type'] is not None else 'xc'
 
         if account_type == 'xc':
-            dialog = PlaylistViewerDialog(entry['server_base_url'], entry['username'], entry['password'], self)
+            dialog = PlaylistViewerDialog(entry['server_base_url'], entry['username'], entry['password'], parent=self)
+            dialog.exec()
+        elif account_type == 'stalker':
+            dialog = PlaylistViewerDialog(
+                server_url=None, username=None, password=None,
+                account_type='stalker',
+                mac_address=entry['mac_address'],
+                portal_url=entry['portal_url'],
+                parent=self
+            )
             dialog.exec()
         else:
-            QMessageBox.information(self, "Info", "Playlist viewer only supports Xtream Codes API accounts currently.")
+            QMessageBox.information(self, "Info", "Playlist viewer only supports Xtream Codes and Stalker Portal accounts currently.")
 
     @Slot(QStandardItem)
     def on_table_item_changed(self, item):
