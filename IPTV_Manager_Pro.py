@@ -1417,18 +1417,19 @@ class PlaylistViewerDialog(QDialog):
         self.load_thread = QThread()
         self.load_worker.moveToThread(self.load_thread)
 
-        self.load_thread.started.connect(self.load_worker.load_all)
-        self.load_worker.data_ready.connect(self.on_data_loaded)
+        # Connect signals for granular loading
+        self.load_worker.category_data_ready.connect(self.on_category_data_loaded)
         self.load_worker.error_occurred.connect(self.on_load_error)
-        self.load_worker.finished.connect(self.load_thread.quit)
-        self.load_worker.finished.connect(self.load_worker.deleteLater)
-        self.load_thread.finished.connect(self.load_thread.deleteLater)
-
-        self.live_status_label.setText("Loading playlist data... Please wait.")
-        self.vod_status_label.setText("Loading playlist data... Please wait.")
-        self.series_status_label.setText("Loading playlist data... Please wait.")
+        # Note: We don't connect finished->quit here because we want the thread to stay alive for lazy loading
 
         self.load_thread.start()
+
+        # Connect tab change to check/load data
+        self.tabs.currentChanged.connect(self.on_tab_changed_lazy)
+
+        # Trigger initial load for the first tab (Live TV)
+        self.live_status_label.setText("Loading Live TV data... Please wait.")
+        QTimer.singleShot(100, lambda: self.request_category_load('live'))
 
     def closeEvent(self, event):
         self.cleanup_ffplay()
@@ -1626,38 +1627,82 @@ class PlaylistViewerDialog(QDialog):
             self.series_group_list = list_widget
             self.series_group_list.currentItemChanged.connect(self.filter_series_streams)
 
-    @Slot(dict)
-    def on_data_loaded(self, data):
-        # Unpack data
-        live_cats = data['live_cats']
-        vod_cats = data['vod_cats']
-        series_cats = data['series_cats']
-        self.live_streams = data['live_streams']
-        self.vod_streams = data['vod_streams']
-        self.series_streams = data['series_streams']
+    def request_category_load(self, category_type):
+        # Trigger the worker method in its thread
+        QMetaObject.invokeMethod(self.load_worker, "load_category", Qt.QueuedConnection, Q_ARG(str, category_type))
 
-        self.populate_list(self.live_group_list, live_cats)
-        self.populate_list(self.vod_group_list, vod_cats)
-        self.populate_list(self.series_group_list, series_cats)
+    def on_tab_changed_lazy(self, index):
+        # Lazy load data for the selected tab if not already loaded
+        cat_type = None
+        if index == 0: cat_type = 'live'
+        elif index == 1: cat_type = 'vod'
+        elif index == 2: cat_type = 'series'
 
-        # Map categories for quick lookup (ID -> Name)
-        self.live_cat_map = {str(c.get('category_id')): c.get('category_name') for c in live_cats}
-        self.vod_cat_map = {str(c.get('category_id')): c.get('category_name') for c in vod_cats}
-        self.series_cat_map = {str(c.get('category_id')): c.get('category_name') for c in series_cats}
+        if not cat_type: return
 
-        # Initial Populate
-        # Select first item to trigger filter
-        if self.live_group_list.count() > 0: self.live_group_list.setCurrentRow(0)
-        if self.vod_group_list.count() > 0: self.vod_group_list.setCurrentRow(0)
-        if self.series_group_list.count() > 0: self.series_group_list.setCurrentRow(0)
+        # Check if data is empty. If so, trigger load.
+        needs_load = False
+        if cat_type == 'live' and not self.live_streams: needs_load = True
+        elif cat_type == 'vod' and not self.vod_streams: needs_load = True
+        elif cat_type == 'series' and not self.series_streams: needs_load = True
 
-        # Init Player if available
-        if HAS_MULTIMEDIA:
+        if needs_load:
+            if cat_type == 'live': self.live_status_label.setText("Loading Live TV...")
+            elif cat_type == 'vod': self.vod_status_label.setText("Loading VOD...")
+            elif cat_type == 'series': self.series_status_label.setText("Loading Series...")
+
+            self.request_category_load(cat_type)
+
+        # Handle player switching
+        self.on_tab_changed(index)
+
+    @Slot(str, dict)
+    def on_category_data_loaded(self, category_type, data):
+        cats = data.get('cats', [])
+        streams = data.get('streams', [])
+
+        # Determine target widgets and storage based on type
+        target_list = None
+        target_table = None
+        target_status = None
+        cat_map = {}
+
+        if category_type == 'live':
+            self.live_streams = streams
+            target_list = self.live_group_list
+            target_table = self.live_table
+            target_status = self.live_status_label
+            # Map categories
+            self.live_cat_map = {str(c.get('category_id')): c.get('category_name') for c in cats}
+            cat_map = self.live_cat_map
+        elif category_type == 'vod':
+            self.vod_streams = streams
+            target_list = self.vod_group_list
+            target_table = self.vod_table
+            target_status = self.vod_status_label
+            self.vod_cat_map = {str(c.get('category_id')): c.get('category_name') for c in cats}
+            cat_map = self.vod_cat_map
+        elif category_type == 'series':
+            self.series_streams = streams
+            target_list = self.series_group_list
+            target_table = self.series_table
+            target_status = self.series_status_label
+            self.series_cat_map = {str(c.get('category_id')): c.get('category_name') for c in cats}
+            cat_map = self.series_cat_map
+
+        # Populate GUI
+        if target_list:
+            self.populate_list(target_list, cats)
+            if target_list.count() > 0:
+                target_list.setCurrentRow(0) # Triggers filter/populate table
+            else:
+                target_status.setText(f"No {category_type} content found.")
+
+        # Init Player if available (only need to do once, but safe to check)
+        if HAS_MULTIMEDIA and not hasattr(self, 'media_player'):
             self.media_player = QMediaPlayer()
             self.audio_output = QAudioOutput()
             self.media_player.setAudioOutput(self.audio_output)
-            # We need to switch video output when tabs change
-            self.tabs.currentChanged.connect(self.on_tab_changed)
             # Set initial output
             self.on_tab_changed(self.tabs.currentIndex())
 
@@ -2156,7 +2201,7 @@ class PlaylistViewerDialog(QDialog):
 # API CHECKER WORKER
 # =============================================================================
 class PlaylistLoaderWorker(QObject):
-    data_ready = Signal(dict)
+    category_data_ready = Signal(str, dict) # type ('live', 'vod', 'series'), data
     error_occurred = Signal(str)
     finished = Signal()
 
@@ -2168,78 +2213,68 @@ class PlaylistLoaderWorker(QObject):
         self.account_type = account_type
         self.mac_address = mac_address
         self.portal_url = portal_url
+        self._session = None
 
-    @Slot()
-    def load_all(self):
+    def _get_session(self):
+        if not self._session:
+            self._session = requests.Session()
+        return self._session
+
+    @Slot(str)
+    def load_category(self, category_type):
+        """Loads data for a specific category: 'live', 'vod', or 'series'."""
         try:
-            # Create a session for reuse
-            session = requests.Session()
+            session = self._get_session()
+            cats = []
+            streams = []
 
             if self.account_type == 'stalker':
-                # --- Stalker Portal Logic ---
-                token = _get_stalker_token(session, self.portal_url, self.mac_address)
-                if not token:
-                    raise Exception("Authentication Failed: Could not get Stalker token.")
+                # Stalker currently treats everything as Live/Channels
+                # For VOD/Series requests on Stalker, we return empty for now or implement later
+                if category_type == 'live':
+                    token = _get_stalker_token(session, self.portal_url, self.mac_address)
+                    if not token:
+                        raise Exception("Authentication Failed: Could not get Stalker token.")
 
-                genres = get_stalker_genres(session, self.portal_url, self.mac_address, token)
-                channels = get_stalker_channels(session, self.portal_url, self.mac_address, token)
+                    genres = get_stalker_genres(session, self.portal_url, self.mac_address, token)
+                    channels = get_stalker_channels(session, self.portal_url, self.mac_address, token)
 
-                # Normalize Stalker Data to XC Structure
-                # Map Genres to Categories
-                live_cats = []
-                for g in genres:
-                    live_cats.append({
-                        'category_id': g.get('id'),
-                        'category_name': g.get('title')
-                    })
+                    # Normalize
+                    for g in genres:
+                        cats.append({'category_id': g.get('id'), 'category_name': g.get('title')})
 
-                # Map Channels to Streams
-                live_streams = []
-                for c in channels:
-                    # Stalker channels have 'id', 'name', 'tv_genre_id', 'cmd' (stream url/id)
-                    live_streams.append({
-                        'stream_id': c.get('cmd'), # We store the 'cmd' as the stream_id for creating links later
-                        'num': c.get('number'),
-                        'name': c.get('name'),
-                        'category_id': c.get('tv_genre_id'),
-                        'is_stalker': True, # Flag for UI
-                        'token': token # Pass token if needed for immediate use, though better re-authed
-                    })
-
-                # Stalker VOD/Series not yet implemented in this view
-                vod_cats = []
-                series_cats = []
-                vod_streams = []
-                series_streams = []
-
+                    for c in channels:
+                        streams.append({
+                            'stream_id': c.get('cmd'),
+                            'num': c.get('number'),
+                            'name': c.get('name'),
+                            'category_id': c.get('tv_genre_id'),
+                            'is_stalker': True,
+                            'token': token
+                        })
             else:
-                # --- Xtream Codes Logic ---
-                # Fetch Categories
-                live_cats = get_live_categories(self.server_url, self.username, self.password, session)
-                vod_cats = get_vod_categories(self.server_url, self.username, self.password, session)
-                series_cats = get_series_categories(self.server_url, self.username, self.password, session)
-
-                # Fetch Streams
-                live_streams = get_live_streams_all(self.server_url, self.username, self.password, session)
-                vod_streams = get_vod_streams_all(self.server_url, self.username, self.password, session)
-                series_streams = get_series_all(self.server_url, self.username, self.password, session)
+                # Xtream Codes Logic
+                if category_type == 'live':
+                    cats = get_live_categories(self.server_url, self.username, self.password, session)
+                    streams = get_live_streams_all(self.server_url, self.username, self.password, session)
+                elif category_type == 'vod':
+                    cats = get_vod_categories(self.server_url, self.username, self.password, session)
+                    streams = get_vod_streams_all(self.server_url, self.username, self.password, session)
+                elif category_type == 'series':
+                    cats = get_series_categories(self.server_url, self.username, self.password, session)
+                    streams = get_series_all(self.server_url, self.username, self.password, session)
 
             data = {
-                'live_cats': live_cats,
-                'vod_cats': vod_cats,
-                'series_cats': series_cats,
-                'live_streams': live_streams,
-                'vod_streams': vod_streams,
-                'series_streams': series_streams,
+                'cats': cats,
+                'streams': streams,
                 'account_type': self.account_type,
                 'portal_url': self.portal_url,
                 'mac_address': self.mac_address
             }
-            self.data_ready.emit(data)
+            self.category_data_ready.emit(category_type, data)
+
         except Exception as e:
-            self.error_occurred.emit(str(e))
-        finally:
-            self.finished.emit()
+            self.error_occurred.emit(f"Error loading {category_type}: {str(e)}")
 
 class ApiCheckerWorker(QObject):
     result_ready = Signal(int, dict)
@@ -2648,6 +2683,12 @@ class MainWindow(QMainWindow):
         self.table_view.setEditTriggers(QAbstractItemView.DoubleClicked | QAbstractItemView.EditKeyPressed)
         self.table_view.setSortingEnabled(True)
         self.table_view.sortByColumn(COL_NAME, Qt.AscendingOrder)
+
+        # Reduce font size by 1pt
+        font = self.table_view.font()
+        font.setPointSize(font.pointSize() - 1)
+        self.table_view.setFont(font)
+
         header = self.table_view.horizontalHeader()
         header.setSectionResizeMode(COL_ID, QHeaderView.Interactive)
         self.table_view.setColumnWidth(COL_ID, 50)
